@@ -1,32 +1,29 @@
 # Airlift
 
-Use a spare Mac as the compute host for engineering agents while keeping the control surface on your main Mac.
+Use a spare Mac as the compute host for Codex and Claude Code while keeping one clean browser cockpit on your main Mac.
 
-Airlift does not invent a new remote-agent protocol. It configures the two proven paths that already have the right interaction model:
+Airlift is a small bootstrap and lifecycle wrapper around [Yep Anywhere](https://github.com/kzahel/yepanywhere), the open-source web UI for the real Codex and Claude Code CLIs. It does not proxy prompts through a new AI provider.
 
-- **Native path:** Codex Remote SSH. The Codex desktop app on the MacBook Pro starts the Codex app server through SSH on the MacBook Air.
-- **Open-source path:** OpenCode Web, bound to `127.0.0.1` on the Air and reached through a private SSH tunnel.
-
-In both paths, repository files, shell commands, tests, worktrees, credentials, and compute stay on the Air.
+The browser runs on Dylan's MacBook Pro. The agents, repositories, shell commands, tests, credentials, and compute run on the MacBook Air.
 
 ## What Dylan gets
 
-- The familiar Codex project/task surface on the Pro.
-- Model and reasoning controls.
-- Standard/Fast mode in Codex.
-- Plan/Build modes and reasoning variants in OpenCode.
-- Streamed commands, diffs, test results, approvals, and task history.
-- No public command server and no router port forwarding.
-- A dedicated SSH key with agent forwarding disabled.
+- One UI for both Codex and Claude Code.
+- Provider and model switching when starting sessions.
+- Reasoning/effort, service-tier, thinking, and permission-mode controls when supported by the selected agent.
+- Streamed output, tool calls, diffs, approvals, questions, and session history.
+- Back-and-forth follow-up messages.
+- Work that continues on the Air if the browser disconnects.
+- No public command server: the cockpit binds to the Air's loopback interface and reaches the Pro through SSH.
 
 ## Two-minute setup
 
-On the **MacBook Air**, do the one macOS step scripts cannot safely do:
+On the **MacBook Air**:
 
 1. Open **System Settings → General → Sharing**.
 2. Turn on **Remote Login**.
-3. Under “Allow access for,” select only the user that should run engineering tasks.
-4. Keep the Air plugged in and awake while it is acting as the worker.
+3. Allow access only for the user that should run engineering tasks.
+4. Keep the Air plugged in while using it as the worker.
 
 On **Dylan's MacBook Pro**:
 
@@ -34,31 +31,29 @@ On **Dylan's MacBook Pro**:
 git clone https://github.com/ojaskandy/airlift.git
 cd airlift
 ./airlift setup dylan@Dylans-MacBook-Air.local
-./airlift codex
+./airlift open
 ```
 
-The setup command:
+Setup creates a dedicated SSH key, installs the cockpit plus Codex and Claude Code on the Air, walks through each one-time login, and keeps the Air awake while it is connected to power.
 
-1. Creates a dedicated Ed25519 key.
-2. Adds a concrete `spare-air` host to `~/.ssh/config`.
-3. Copies the key after one Mac password prompt.
-4. Installs Codex and OpenCode on the Air if needed.
-5. Ensures both tools are on the remote login-shell `PATH`.
-6. Runs the one-time Codex device login if needed.
-7. Starts a macOS keep-awake assertion that applies while the Air is on AC power.
-
-Codex opens at **Settings → Connections → SSH**. Select `spare-air`, choose a project folder on the Air, and send the task.
+If the Air's username is not `dylan`, replace the username in the setup command.
 
 ## Put a repository on the Air
 
-Clone directly on the worker:
+Clone it directly on the worker:
 
 ```bash
 ./airlift clone git@github.com:your-org/your-repo.git
-./airlift codex
+./airlift open
 ```
 
-For private GitHub repositories, authenticate GitHub on the Air first:
+Or open an existing Air-side checkout:
+
+```bash
+./airlift open '~/Developer/your-repo'
+```
+
+For a private GitHub repository, authenticate GitHub on the Air once:
 
 ```bash
 ./airlift shell
@@ -67,80 +62,70 @@ gh auth setup-git
 exit
 ```
 
-Codex can also hand off an active task and its Git state between matching projects on the Pro and Air. It creates or reuses worktrees rather than synchronizing a mutable checkout with `rsync`.
-
-## Fully open-source browser surface
-
-OpenCode and its web UI are MIT licensed. Launch the UI from the Pro while the server and agent run on the Air:
+## Daily use
 
 ```bash
-./airlift web '~/Developer/your-repo'
+./airlift open                         # Open the last project
+./airlift open '~/Developer/project'   # Open a specific Air-side project
+./airlift doctor                       # Check SSH, agents, auth, disk, and power
+./airlift shell                        # Get a normal shell on the Air
+./airlift stop                         # Close only the tunnel; active work continues
+./airlift shutdown                     # Stop the cockpit; use after work is idle
 ```
 
-This opens `http://127.0.0.1:4096` on the Pro through an SSH local forward. The OpenCode server remains bound to loopback on the Air.
-
-Inside OpenCode:
-
-- Switch between Plan and Build.
-- Choose providers and models.
-- Cycle reasoning variants: OpenAI `none` through `xhigh`, Anthropic `high`/`max`, and provider-specific variants.
-- Use `/connect` once to add a model provider.
-
-Stop the browser session later:
-
-```bash
-./airlift stop
-```
-
-## Useful commands
-
-```bash
-./airlift doctor                 # SSH, app, auth, versions, disk, and power
-./airlift shell                  # Open a shell on the Air
-./airlift awake                  # Keep the Air awake while it is on AC power
-./airlift sleep                  # Release Airlift's keep-awake assertion
-./airlift login codex            # Redo Codex device auth on the Air
-./airlift login opencode         # Configure an OpenCode provider
-./airlift config                 # Show the saved connection
-./airlift web --local-port 4097  # Avoid a local port conflict
-```
+Inside the cockpit, choose **Claude Code** or **Codex**, select the model and available mode/effort controls, enter a prompt, and continue the conversation normally.
 
 Optional global installation:
 
 ```bash
 ./install.sh
-airlift doctor
+airlift open
 ```
 
-## Different Air hostname or SSH alias
+## What setup installs
+
+Airlift installs these packages into the Air user's `~/.local` directory when they are missing:
+
+- `@openai/codex`
+- `@anthropic-ai/claude-code`
+- `yepanywhere`
+
+If the Air does not already have Node.js 22 or newer, Airlift downloads the current Node.js LTS release from nodejs.org, verifies its SHA-256 checksum, and installs it under `~/.airlift/runtime`. No administrator access is required.
+
+To redo authentication:
+
+```bash
+./airlift login codex
+./airlift login claude
+```
+
+## Different hostname or SSH alias
 
 ```bash
 ./airlift setup offload@192.168.1.42 --alias dylan-air
 ```
 
-Codex auto-discovers concrete aliases from `~/.ssh/config`; wildcard-only hosts are not enough.
+For access away from the local network, connect both Macs with a private mesh VPN such as Tailscale and keep using normal SSH. Do not expose port 22 or the cockpit port directly from the router.
 
 ## Security defaults
 
 - OpenSSH is the only network entry point.
 - `ForwardAgent no` prevents the Air from using Dylan's Pro SSH agent.
-- OpenCode binds only to `127.0.0.1` and is exposed to the Pro only through a local SSH forward.
-- Codex app-server transports are never exposed directly.
-- Host key verification remains enabled.
-- The setup writes only a marked host block and keeps `~/.ssh/config.airlift.bak`.
-
-For access away from the local network, use a private mesh VPN such as Tailscale and continue using ordinary SSH over it. Do not forward port 22 or an agent HTTP port from the router to the public internet.
+- Yep Anywhere binds to `127.0.0.1` on the Air.
+- The browser reaches it through an SSH local forward to `127.0.0.1` on the Pro.
+- Host-key verification remains enabled.
+- The setup edits only a marked SSH config block and keeps `~/.ssh/config.airlift.bak`.
 
 For the strongest boundary, create a standard non-admin `offload` user on the Air and keep unrelated personal credentials out of that account.
 
 ## Open-source foundation
 
+- [Yep Anywhere](https://github.com/kzahel/yepanywhere) — MIT
 - [OpenAI Codex CLI](https://github.com/openai/codex) — Apache-2.0
-- [OpenCode](https://github.com/anomalyco/opencode) — MIT
-- [OpenChamber](https://github.com/openchamber/openchamber) — MIT, a richer optional OpenCode desktop client
-- OpenSSH, included with macOS
+- [Claude Code](https://github.com/anthropics/claude-code) — Anthropic's official CLI
+- OpenSSH — included with macOS
 
-Airlift is a bootstrap and lifecycle wrapper. It does not vendor or modify those projects.
+Airlift does not vendor or modify these projects.
 
 ## Troubleshooting
 
@@ -154,9 +139,9 @@ Common failures:
 
 - **Connection refused:** enable Remote Login on the Air.
 - **Air disappears:** keep it plugged in and awake. Closing a Mac laptop lid normally suspends it unless using a supported clamshell setup.
-- **Codex host not listed:** the SSH entry must be a concrete `Host` alias; rerun `./airlift setup`.
-- **Codex cannot start remotely:** run `./airlift shell`, then `codex --version` and `codex login status`. Airlift adds Homebrew and agent install directories to `.zprofile`.
+- **Sign-in required:** run `./airlift login codex` or `./airlift login claude`.
 - **Private clone fails:** authenticate GitHub separately on the Air. Airlift intentionally does not forward Dylan's Pro credentials.
+- **Local port 3400 is busy:** run `./airlift open --local-port 3401`.
 
 ## License
 

@@ -1,0 +1,18 @@
+#!/bin/bash
+
+set -euo pipefail
+
+case "${1:-}" in
+  --version|-v)
+    printf '0.6.2\n'
+    exit 0
+    ;;
+esac
+
+mkdir -p "$HOME/.airlift"
+touch "$HOME/.airlift/fake-yep-ready"
+
+trap 'exit 0' TERM INT
+while :; do
+  sleep 5
+done

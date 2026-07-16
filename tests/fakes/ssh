@@ -2,6 +2,22 @@
 
 set -euo pipefail
 
+for arg in "$@"; do
+  case "$arg" in
+    -fN)
+      exit 0
+      ;;
+  esac
+done
+
+previous=""
+for arg in "$@"; do
+  if [ "$previous" = "-O" ] && [ "$arg" = "exit" ]; then
+    exit 0
+  fi
+  previous="$arg"
+done
+
 last="${!#}"
 case "$last" in
   true)
