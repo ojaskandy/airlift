@@ -1,0 +1,13 @@
+#!/bin/bash
+
+set -euo pipefail
+
+last="${!#}"
+case "$last" in
+  true)
+    exit 0
+    ;;
+  *)
+    exec bash -c "$last"
+    ;;
+esac
