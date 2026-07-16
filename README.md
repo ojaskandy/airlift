@@ -6,6 +6,23 @@ Airlift is a small bootstrap and lifecycle wrapper around [Yep Anywhere](https:/
 
 The browser runs on Dylan's MacBook Pro. The agents, repositories, shell commands, tests, credentials, and compute run on the MacBook Air.
 
+## Send this to Dylan
+
+First, on the **MacBook Air**, turn on:
+
+**System Settings → General → Sharing → Remote Login**
+
+Then run this on the **MacBook Pro**:
+
+```bash
+git clone https://github.com/ojaskandy/airlift.git
+cd airlift
+./airlift setup <air-username>@Dylans-MacBook-Air.local
+./airlift open
+```
+
+Replace `<air-username>` with the login username shown on the MacBook Air. The setup command handles the remaining Air-side installation and opens the one-time Codex and Claude Code sign-ins.
+
 ## What Dylan gets
 
 - One UI for both Codex and Claude Code.
