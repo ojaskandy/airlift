@@ -84,7 +84,7 @@ exit
 ```bash
 ./airlift open                         # Open the last project
 ./airlift open '~/Developer/project'   # Open a specific Air-side project
-./airlift doctor                       # Check SSH, agents, auth, disk, and power
+./airlift doctor                       # Check SSH, agents, accounts, disk, and power
 ./airlift shell                        # Get a normal shell on the Air
 ./airlift stop                         # Close only the tunnel; active work continues
 ./airlift shutdown                     # Stop the cockpit; use after work is idle
@@ -123,6 +123,40 @@ To redo authentication:
 ```
 
 For access away from the local network, connect both Macs with a private mesh VPN such as Tailscale and keep using normal SSH. Do not expose port 22 or the cockpit port directly from the router.
+
+## Know which account you are spending
+
+The cockpit's provider picker runs whichever account each agent is signed in as on
+the Air. If the Air is a borrowed machine, an agent may already be signed in as its
+owner, and selecting that provider spends the owner's quota under the owner's
+identity.
+
+`./airlift doctor` names the account behind each agent and warns when Codex and
+Claude are signed in as different accounts:
+
+```
+Agents
+  Codex:   codex-cli 0.128.0
+  Auth:    owner@example.com (pro)
+  Claude:  2.1.201 (Claude Code)
+  Auth:    you@example.com (max)
+
+  ! Codex and Claude are signed in as DIFFERENT accounts.
+```
+
+Re-authenticate the odd one out with `./airlift login codex` or
+`./airlift login claude`. Note that signing in replaces the account for that agent
+across the whole Air user, including the owner's own use of that CLI.
+
+## Keeping the Air awake
+
+`./airlift awake` supervises its keep-awake assertion and restarts it if it dies,
+because a lone `caffeinate` is a single point of failure: if it exits, the Air
+sleeps and every running agent stops.
+
+`./airlift doctor` verifies the live `pmset` assertion rather than a PID file, and
+says so loudly when nothing is holding the Air awake. The assertion only holds on
+AC power, so keep the Air plugged in.
 
 ## Security defaults
 

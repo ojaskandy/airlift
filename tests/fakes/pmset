@@ -1,0 +1,28 @@
+#!/bin/bash
+
+set -euo pipefail
+
+case "${1:-}${2:-}" in
+  -gcustom)
+    cat <<'PMSET'
+Battery Power:
+ displaysleep         30
+ sleep                0
+AC Power:
+ displaysleep         30
+ sleep                1
+PMSET
+    exit 0
+    ;;
+  -gbatt)
+    printf "Now drawing from 'AC Power'\n"
+    exit 0
+    ;;
+  -gassertions)
+    printf 'Assertion status system-wide:\n'
+    printf '   PreventSystemSleep             0\n'
+    exit 0
+    ;;
+esac
+
+exit 0

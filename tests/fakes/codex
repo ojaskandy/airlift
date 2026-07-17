@@ -1,0 +1,20 @@
+#!/bin/bash
+
+set -euo pipefail
+
+case "${1:-}" in
+  --version)
+    printf 'codex-cli 0.9.0\n'
+    exit 0
+    ;;
+  login)
+    case "${2:-}" in
+      status)
+        printf 'Logged in using ChatGPT\n'
+        exit 0
+        ;;
+    esac
+    ;;
+esac
+
+exit 0

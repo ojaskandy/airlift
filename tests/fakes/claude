@@ -1,0 +1,20 @@
+#!/bin/bash
+
+set -euo pipefail
+
+case "${1:-}" in
+  --version)
+    printf '1.2.3 (Claude Code)\n'
+    exit 0
+    ;;
+  auth)
+    case "${2:-}" in
+      status)
+        printf '%s\n' '{"loggedIn":true,"authMethod":"claude.ai","email":"dylan@example.com","subscriptionType":"max"}'
+        exit 0
+        ;;
+    esac
+    ;;
+esac
+
+exit 0

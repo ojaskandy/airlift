@@ -1,0 +1,18 @@
+#!/bin/bash
+
+set -euo pipefail
+
+case "${1:-}" in
+  -g)
+    printf 'Filesystem 1G-blocks Used Avail Capacity Mounted on\n'
+    printf '/dev/disk3s5 460 402 13 97%% /System/Volumes/Data\n'
+    exit 0
+    ;;
+  -h)
+    printf 'Filesystem Size Used Avail Capacity Mounted on\n'
+    printf '/dev/disk3s5 460Gi 402Gi 13Gi 97%% /System/Volumes/Data\n'
+    exit 0
+    ;;
+esac
+
+exit 0

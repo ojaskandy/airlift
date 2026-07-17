@@ -2,7 +2,9 @@
 
 set -euo pipefail
 
-VERSION="0.2.0"
+VERSION="0.3.0"
+# Minimum free disk on the Air before cloning a repository and building is safe.
+MIN_DISK_GB="${AIRLIFT_MIN_DISK_GB:-25}"
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/airlift"
 CONFIG_FILE="$CONFIG_DIR/config"
 KEY_FILE="$HOME/.ssh/airlift_ed25519"
@@ -733,39 +735,92 @@ awake_cmd() {
   ssh "$AIRLIFT_ALIAS" "bash -s" <<'REMOTE'
 set -eu
 mkdir -p "$HOME/.airlift/logs"
-pid_file="$HOME/.airlift/caffeinate.pid"
+supervisor_pid_file="$HOME/.airlift/keepawake.pid"
+script_file="$HOME/.airlift/keepawake.sh"
+stop_file="$HOME/.airlift/keepawake.stop"
 
-if [ -f "$pid_file" ]; then
-  pid="$(cat "$pid_file" 2>/dev/null || true)"
+# A bare caffeinate is a single point of failure: if it exits, the Air sleeps and
+# every running agent stops. Supervise it instead, and restart it if it dies.
+if [ -f "$supervisor_pid_file" ]; then
+  pid="$(cat "$supervisor_pid_file" 2>/dev/null || true)"
   if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
     command_line="$(ps -p "$pid" -o command= 2>/dev/null || true)"
     case "$command_line" in
-      *caffeinate*) exit 0 ;;
+      *keepawake.sh*) exit 0 ;;
     esac
   fi
 fi
 
-nohup /usr/bin/caffeinate -s >"$HOME/.airlift/logs/caffeinate.log" 2>&1 </dev/null &
-printf '%s\n' "$!" >"$pid_file"
+rm -f "$stop_file"
+
+cat >"$script_file" <<'SUPERVISOR'
+#!/bin/bash
+set -u
+
+stop_file="$HOME/.airlift/keepawake.stop"
+caffeinate_pid_file="$HOME/.airlift/caffeinate.pid"
+caffeinate_pid=""
+
+shut_down() {
+  if [ -n "$caffeinate_pid" ]; then
+    kill "$caffeinate_pid" 2>/dev/null || true
+  fi
+  rm -f "$caffeinate_pid_file"
+  exit 0
+}
+
+trap shut_down TERM INT
+
+while :; do
+  [ -f "$stop_file" ] && break
+  /usr/bin/caffeinate -s &
+  caffeinate_pid=$!
+  printf '%s\n' "$caffeinate_pid" >"$caffeinate_pid_file"
+  wait "$caffeinate_pid" 2>/dev/null || true
+  caffeinate_pid=""
+  [ -f "$stop_file" ] && break
+  printf '%s keep-awake assertion exited; restarting\n' \
+    "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+  sleep 2
+done
+
+rm -f "$caffeinate_pid_file"
+SUPERVISOR
+
+chmod 700 "$script_file"
+nohup "$script_file" >>"$HOME/.airlift/logs/keepawake.log" 2>&1 </dev/null &
+printf '%s\n' "$!" >"$supervisor_pid_file"
 REMOTE
   ok "The Air will stay awake while connected to AC power."
+  say "${DIM}Keep-awake is supervised and restarts if the assertion dies.${RESET}"
+  say "${DIM}Verify any time with: airlift doctor${RESET}"
 }
 
 sleep_cmd() {
   load_config
   ssh "$AIRLIFT_ALIAS" "bash -s" <<'REMOTE'
 set -eu
-pid_file="$HOME/.airlift/caffeinate.pid"
-if [ -f "$pid_file" ]; then
+stop_file="$HOME/.airlift/keepawake.stop"
+: >"$stop_file"
+
+stop_pid_file() {
+  pid_file="$1"
+  pattern="$2"
+  [ -f "$pid_file" ] || return 0
   pid="$(cat "$pid_file" 2>/dev/null || true)"
   if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
     command_line="$(ps -p "$pid" -o command= 2>/dev/null || true)"
     case "$command_line" in
-      *caffeinate*) kill "$pid" 2>/dev/null || true ;;
+      *"$pattern"*) kill "$pid" 2>/dev/null || true ;;
     esac
   fi
   rm -f "$pid_file"
-fi
+}
+
+# Stop the supervisor first so it does not restart the assertion we are killing.
+stop_pid_file "$HOME/.airlift/keepawake.pid" keepawake.sh
+stop_pid_file "$HOME/.airlift/caffeinate.pid" caffeinate
+rm -f "$stop_file"
 REMOTE
   ok "Released Airlift's keep-awake assertion."
 }
@@ -786,22 +841,113 @@ doctor_cmd() {
     exit 1
   fi
 
-  ssh "$AIRLIFT_ALIAS" "bash -s" <<'REMOTE'
+  local quoted_min_disk
+  quoted_min_disk="$(shell_quote "$MIN_DISK_GB")"
+
+  ssh "$AIRLIFT_ALIAS" "AIRLIFT_MIN_DISK_GB=$quoted_min_disk bash -s" <<'REMOTE'
 set -u
 export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$HOME/.codex/bin:$PATH"
+
+# Which ChatGPT account Codex would spend quota as. Reads only the identity
+# claims of the local id_token; never prints tokens.
+codex_identity() {
+  auth_file="$HOME/.codex/auth.json"
+  [ -f "$auth_file" ] || return 1
+  command -v node >/dev/null 2>&1 || return 1
+  node -e '
+    const fs = require("fs");
+    try {
+      const auth = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+      const token = auth.tokens && auth.tokens.id_token;
+      if (!token) {
+        process.stdout.write(auth.OPENAI_API_KEY ? "api-key" : "");
+        process.exit(0);
+      }
+      const claims = JSON.parse(
+        Buffer.from(token.split(".")[1], "base64url").toString("utf8")
+      );
+      process.stdout.write(claims.email || "");
+    } catch (error) {
+      process.exit(1);
+    }
+  ' "$auth_file" 2>/dev/null
+}
+
+codex_plan() {
+  auth_file="$HOME/.codex/auth.json"
+  [ -f "$auth_file" ] || return 1
+  command -v node >/dev/null 2>&1 || return 1
+  node -e '
+    const fs = require("fs");
+    try {
+      const auth = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+      const token = auth.tokens && auth.tokens.id_token;
+      if (!token) process.exit(0);
+      const claims = JSON.parse(
+        Buffer.from(token.split(".")[1], "base64url").toString("utf8")
+      );
+      const detail = claims["https://api.openai.com/auth"] || {};
+      process.stdout.write(detail.chatgpt_plan_type || "");
+    } catch (error) {
+      process.exit(1);
+    }
+  ' "$auth_file" 2>/dev/null
+}
+
+claude_field() {
+  command -v node >/dev/null 2>&1 || return 1
+  claude auth status 2>/dev/null | node -e '
+    let raw = "";
+    process.stdin.on("data", (chunk) => (raw += chunk));
+    process.stdin.on("end", () => {
+      try {
+        process.stdout.write(String(JSON.parse(raw)[process.argv[1]] || ""));
+      } catch (error) {
+        process.exit(1);
+      }
+    });
+  ' "$1" 2>/dev/null
+}
 
 printf '\nRemote machine\n'
 printf '  Name:    %s\n' "$(scutil --get ComputerName 2>/dev/null || hostname)"
 printf '  macOS:   %s\n' "$(sw_vers -productVersion 2>/dev/null || printf unknown)"
 printf '  Chip:    %s\n' "$(uname -m)"
 printf '  Shell:   %s\n' "${SHELL:-unknown}"
-printf '  Disk:    %s\n' "$(df -h "$HOME" | awk 'NR == 2 { print $4 " free" }')"
+
+disk_free_gb="$(df -g "$HOME" 2>/dev/null | awk 'NR == 2 { print $4 }')"
+printf '  Disk:    %s (%s used)\n' \
+  "$(df -h "$HOME" | awk 'NR == 2 { print $4 " free" }')" \
+  "$(df -h "$HOME" | awk 'NR == 2 { print $5 }')"
+case "$disk_free_gb" in
+  ''|*[!0-9]*) ;;
+  *)
+    if [ "$disk_free_gb" -lt "$AIRLIFT_MIN_DISK_GB" ]; then
+      printf '  ! Only %sGi free. Airlift wants at least %sGi to clone and build safely.\n' \
+        "$disk_free_gb" "$AIRLIFT_MIN_DISK_GB"
+      printf '    Cloning a large repository or running a build may fail or fill the disk.\n'
+    fi
+    ;;
+esac
 
 printf '\nAgents\n'
+codex_account=""
+claude_account=""
+
 if command -v codex >/dev/null 2>&1; then
   printf '  Codex:   %s\n' "$(codex --version 2>/dev/null)"
   if codex login status >/dev/null 2>&1; then
-    printf '  Auth:    ready\n'
+    codex_account="$(codex_identity || true)"
+    codex_plan_name="$(codex_plan || true)"
+    if [ -n "$codex_account" ]; then
+      if [ -n "$codex_plan_name" ]; then
+        printf '  Auth:    %s (%s)\n' "$codex_account" "$codex_plan_name"
+      else
+        printf '  Auth:    %s\n' "$codex_account"
+      fi
+    else
+      printf '  Auth:    ready (account could not be identified)\n'
+    fi
   else
     printf '  Auth:    sign-in required\n'
   fi
@@ -812,7 +958,17 @@ fi
 if command -v claude >/dev/null 2>&1; then
   printf '  Claude:  %s\n' "$(claude --version 2>/dev/null)"
   if claude auth status >/dev/null 2>&1; then
-    printf '  Auth:    ready\n'
+    claude_account="$(claude_field email || true)"
+    claude_plan="$(claude_field subscriptionType || true)"
+    if [ -n "$claude_account" ]; then
+      if [ -n "$claude_plan" ]; then
+        printf '  Auth:    %s (%s)\n' "$claude_account" "$claude_plan"
+      else
+        printf '  Auth:    %s\n' "$claude_account"
+      fi
+    else
+      printf '  Auth:    ready (account could not be identified)\n'
+    fi
   else
     printf '  Auth:    sign-in required\n'
   fi
@@ -826,19 +982,76 @@ else
   printf '  Cockpit: not installed\n'
 fi
 
+# The cockpit's provider picker spends whichever account each agent is signed in
+# as. Different accounts means one of them is not yours.
+if [ -n "$codex_account" ] && [ -n "$claude_account" ] &&
+  [ "$codex_account" != "$claude_account" ]; then
+  printf '\n  ! Codex and Claude are signed in as DIFFERENT accounts.\n'
+  printf '      Codex:  %s\n' "$codex_account"
+  printf '      Claude: %s\n' "$claude_account"
+  printf '    Choosing Codex in the cockpit spends %s quota, under that identity.\n' \
+    "$codex_account"
+  printf '    Fix with: airlift login codex\n'
+fi
+
 printf '\nPower\n'
 if command -v pmset >/dev/null 2>&1; then
-  pmset -g custom 2>/dev/null | awk '
-    /AC Power/ { ac = 1; next }
-    ac && / sleep / { print "  AC sleep:" $2 " minutes"; exit }
-  '
+  ac_sleep="$(
+    pmset -g custom 2>/dev/null |
+      awk '/AC Power/ { ac = 1; next } ac && / sleep / { print $2; exit }'
+  )"
+  [ -n "$ac_sleep" ] && printf '  AC sleep:   %s minutes when idle and unheld\n' "$ac_sleep"
+  power_source="$(
+    pmset -g batt 2>/dev/null | awk -F "'" '/Now drawing/ { print $2; exit }'
+  )"
+  [ -n "$power_source" ] && printf '  Source:     %s\n' "$power_source"
 fi
-if [ -f "$HOME/.airlift/caffeinate.pid" ]; then
-  caffeinate_pid="$(cat "$HOME/.airlift/caffeinate.pid" 2>/dev/null || true)"
-  if [ -n "$caffeinate_pid" ] && kill -0 "$caffeinate_pid" 2>/dev/null; then
-    printf '  Airlift: keep-awake active on AC power\n'
+
+# Ground truth is the pmset assertion, not the pid file: a pid can be alive
+# while holding no assertion, and caffeinate -s only holds on AC power.
+supervised=0
+if [ -f "$HOME/.airlift/keepawake.pid" ]; then
+  supervisor_pid="$(cat "$HOME/.airlift/keepawake.pid" 2>/dev/null || true)"
+  if [ -n "$supervisor_pid" ] && kill -0 "$supervisor_pid" 2>/dev/null; then
+    case "$(ps -p "$supervisor_pid" -o command= 2>/dev/null || true)" in
+      *keepawake.sh*) supervised=1 ;;
+    esac
   fi
 fi
+
+asserted=0
+if [ -f "$HOME/.airlift/caffeinate.pid" ] && command -v pmset >/dev/null 2>&1; then
+  caffeinate_pid="$(cat "$HOME/.airlift/caffeinate.pid" 2>/dev/null || true)"
+  if [ -n "$caffeinate_pid" ] && kill -0 "$caffeinate_pid" 2>/dev/null; then
+    if pmset -g assertions 2>/dev/null |
+      grep -F "pid $caffeinate_pid(caffeinate)" >/dev/null 2>&1; then
+      asserted=1
+    fi
+  fi
+fi
+
+if [ "$asserted" -eq 1 ] && [ "$supervised" -eq 1 ]; then
+  printf '  Keep-awake: active and supervised (restarts if it dies)\n'
+elif [ "$asserted" -eq 1 ]; then
+  printf '  Keep-awake: active, NOT supervised\n'
+  printf '  ! If this assertion dies the Air sleeps and all remote work stops.\n'
+  printf '    Re-run: airlift awake\n'
+else
+  printf '  Keep-awake: NOT ACTIVE\n'
+  printf '  ! Airlift is holding no keep-awake assertion.\n'
+  if [ -n "${ac_sleep:-}" ] && [ "${ac_sleep:-0}" != "0" ]; then
+    printf '    The Air sleeps after %s idle minutes on AC and all remote work stops.\n' \
+      "$ac_sleep"
+  fi
+  printf '    Start it with: airlift awake\n'
+fi
+
+case "${power_source:-}" in
+  *Battery*)
+    printf '  ! On battery power. caffeinate -s only holds on AC.\n'
+    printf '    Plug the Air in to keep agents running.\n'
+    ;;
+esac
 REMOTE
 
   say ""

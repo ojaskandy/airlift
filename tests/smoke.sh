@@ -70,6 +70,50 @@ HOME="$TEMP_HOME" \
 XDG_CONFIG_HOME="$TEMP_HOME/.config" \
 "$ROOT/airlift" shutdown >/dev/null
 
+# Doctor must name the account behind each agent, not just report "ready".
+# A mismatch means the cockpit's provider picker would spend someone else's quota.
+
+# The remote scripts prepend ~/.local/bin to PATH, which is where Airlift installs
+# the agents. Stage the fakes there so a real codex/claude cannot shadow them.
+mkdir -p "$TEMP_HOME/.local/bin"
+ln -sf "$ROOT/tests/fakes/codex" "$TEMP_HOME/.local/bin/codex"
+ln -sf "$ROOT/tests/fakes/claude" "$TEMP_HOME/.local/bin/claude"
+
+mkdir -p "$TEMP_HOME/.codex"
+node -e '
+  const fs = require("fs");
+  const claims = {
+    email: "ojas@example.com",
+    "https://api.openai.com/auth": { chatgpt_plan_type: "pro" },
+  };
+  const payload = Buffer.from(JSON.stringify(claims)).toString("base64url");
+  fs.writeFileSync(
+    process.argv[1],
+    JSON.stringify({
+      auth_mode: "chatgpt",
+      tokens: { id_token: ["header", payload, "signature"].join(".") },
+    })
+  );
+' "$TEMP_HOME/.codex/auth.json"
+
+DOCTOR_LOG="$TEMP_HOME/doctor.log"
+PATH="$ROOT/tests/fakes:$PATH" \
+HOME="$TEMP_HOME" \
+XDG_CONFIG_HOME="$TEMP_HOME/.config" \
+"$ROOT/airlift" doctor >"$DOCTOR_LOG" 2>&1
+
+grep -F "ojas@example.com (pro)" "$DOCTOR_LOG" >/dev/null
+grep -F "dylan@example.com (max)" "$DOCTOR_LOG" >/dev/null
+grep -F "DIFFERENT accounts" "$DOCTOR_LOG" >/dev/null
+
+# A dead keep-awake must be loud, not silent.
+grep -F "Keep-awake: NOT ACTIVE" "$DOCTOR_LOG" >/dev/null
+grep -F "sleeps after 1 idle minutes on AC" "$DOCTOR_LOG" >/dev/null
+
+# Low disk headroom must be called out before a clone or build fills the disk.
+grep -F "Only 13Gi free" "$DOCTOR_LOG" >/dev/null
+grep -F "at least 25Gi" "$DOCTOR_LOG" >/dev/null
+
 HOME="$TEMP_HOME" "$ROOT/install.sh" >/dev/null
 [ -x "$TEMP_HOME/.local/bin/airlift" ]
 
