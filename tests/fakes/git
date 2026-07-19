@@ -1,0 +1,11 @@
+#!/bin/bash
+
+set -euo pipefail
+
+if [ "${1:-}" = "clone" ]; then
+  destination="${!#}"
+  mkdir -p "$destination/.git"
+  exit 0
+fi
+
+exit 0

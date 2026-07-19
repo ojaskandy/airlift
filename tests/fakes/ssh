@@ -2,6 +2,21 @@
 
 set -euo pipefail
 
+if [ -n "${AIRLIFT_TEST_SSH_LOG:-}" ]; then
+  printf '%s\n' "$*" >>"$AIRLIFT_TEST_SSH_LOG"
+fi
+
+last="${!#}"
+if [[ "$last" == *"AIRLIFT_METRICS=1"* ]] && [ -n "${AIRLIFT_TEST_METRICS_DIR:-}" ]; then
+  for arg in "$@"; do
+    if [ -f "$AIRLIFT_TEST_METRICS_DIR/$arg" ]; then
+      cat "$AIRLIFT_TEST_METRICS_DIR/$arg"
+      exit 0
+    fi
+  done
+  exit 255
+fi
+
 for arg in "$@"; do
   case "$arg" in
     -fN)
@@ -18,7 +33,6 @@ for arg in "$@"; do
   previous="$arg"
 done
 
-last="${!#}"
 case "$last" in
   true)
     exit 0

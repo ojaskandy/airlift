@@ -1,0 +1,21 @@
+#!/bin/bash
+
+set -euo pipefail
+
+case "${1:-}" in
+  --version|-v)
+    printf 'claude test\n'
+    exit 0
+    ;;
+  auth)
+    exit 0
+    ;;
+  -p|--print)
+    printf 'claude[%s]: ' "$PWD"
+    cat
+    printf '\n'
+    exit 0
+    ;;
+esac
+
+exit 1
