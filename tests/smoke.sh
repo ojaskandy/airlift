@@ -30,7 +30,16 @@ airlift_test() {
 
 bash -n "$ROOT/airlift"
 bash -n "$ROOT/install.sh"
+bash -n "$ROOT/install-worker.sh"
+bash -n "$ROOT/Install Airlift Worker.command"
 chmod +x "$ROOT"/tests/fakes/*
+
+WORKER_DRY_RUN="$("$ROOT/install-worker.sh" --dry-run)"
+printf '%s\n' "$WORKER_DRY_RUN" | grep -F "systemsetup -setremotelogin on" >/dev/null
+printf '%s\n' "$WORKER_DRY_RUN" | grep -F "Would preserve the existing Remote Login ACL" >/dev/null
+
+WORKER_WRAPPER_DRY_RUN="$("$ROOT/install.sh" --worker --dry-run)"
+printf '%s\n' "$WORKER_WRAPPER_DRY_RUN" | grep -F "systemsetup -setremotelogin on" >/dev/null
 
 "$ROOT/airlift" --version | grep -F "airlift 0.3.0"
 "$ROOT/airlift" --help | grep -F "Airlift"

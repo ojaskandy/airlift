@@ -16,9 +16,31 @@ through a new AI provider.
 
 ## Send this to Dylan
 
-On every Mac that will do work, turn on:
+On every Mac that will do work, clone Airlift and double-click
+**Install Airlift Worker.command**. It installs the CLI, asks for macOS
+administrator approval, enables Remote Login, and prints that Mac's exact join
+command.
 
-**System Settings → General → Sharing → Remote Login**
+Or use the one-line worker installer in Terminal:
+
+```bash
+/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/ojaskandy/airlift/main/install-worker.sh)"
+```
+
+macOS always shows an administrator prompt before a script can change Remote
+Login. If you want to inspect the script first:
+
+```bash
+curl -fsSLO https://raw.githubusercontent.com/ojaskandy/airlift/main/install-worker.sh
+less install-worker.sh
+bash install-worker.sh
+```
+
+To preview every privileged action without changing the Mac:
+
+```bash
+bash install-worker.sh --dry-run
+```
 
 Then run this on Dylan's MacBook Pro:
 
@@ -39,6 +61,13 @@ cd airlift
 Replace each username and hostname with the values shown on that worker Mac.
 `setup` is the compatible one-worker path from Airlift v0.2; `join` adds more
 workers to the same local pool.
+
+The initial worker bootstrap must run locally once: a controller cannot connect
+over SSH until Remote Login is enabled. Airlift uses Apple's supported
+[`systemsetup -setremotelogin on`](https://support.apple.com/guide/remote-desktop/about-systemsetup-apd95406b8d/mac)
+command and preserves the worker's existing allowed-users policy, adding only
+the user running the installer when necessary. You can review that policy later
+under **System Settings → General → Sharing → Remote Login**.
 
 ## Route a task
 
@@ -203,6 +232,12 @@ Optional global installation:
 ```bash
 ./install.sh
 airlift nodes
+```
+
+Without cloning the repository first:
+
+```bash
+/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/ojaskandy/airlift/main/install.sh)"
 ```
 
 ## What `setup` and `join` install
