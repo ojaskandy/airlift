@@ -31,12 +31,16 @@ airlift_test() {
 bash -n "$ROOT/airlift"
 bash -n "$ROOT/install.sh"
 bash -n "$ROOT/install-worker.sh"
-bash -n "$ROOT/Install Airlift Worker.command"
 chmod +x "$ROOT"/tests/fakes/*
 
 WORKER_DRY_RUN="$("$ROOT/install-worker.sh" --dry-run)"
 printf '%s\n' "$WORKER_DRY_RUN" | grep -F "systemsetup -setremotelogin on" >/dev/null
 printf '%s\n' "$WORKER_DRY_RUN" | grep -F "Would preserve the existing Remote Login ACL" >/dev/null
+
+# Exercise the exact `bash -c "$(curl ...)" -- --dry-run` invocation shape
+# without depending on GitHub or changing this test Mac.
+WORKER_ONE_COMMAND_DRY_RUN="$(/bin/bash -c "$(< "$ROOT/install-worker.sh")" -- --dry-run)"
+printf '%s\n' "$WORKER_ONE_COMMAND_DRY_RUN" | grep -F "systemsetup -setremotelogin on" >/dev/null
 
 WORKER_WRAPPER_DRY_RUN="$("$ROOT/install.sh" --worker --dry-run)"
 printf '%s\n' "$WORKER_WRAPPER_DRY_RUN" | grep -F "systemsetup -setremotelogin on" >/dev/null

@@ -16,30 +16,29 @@ through a new AI provider.
 
 ## Send this to Dylan
 
-On every Mac that will do work, clone Airlift and double-click
-**Install Airlift Worker.command**. It installs the CLI, asks for macOS
-administrator approval, enables Remote Login, and prints that Mac's exact join
-command.
-
-Or use the one-line worker installer in Terminal:
+On every Mac that will do work, open Terminal and run exactly one command:
 
 ```bash
 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/ojaskandy/airlift/main/install-worker.sh)"
 ```
 
+The command downloads the public worker installer over HTTPS and runs it as the
+current user. The installer:
+
+- installs the `airlift` command under `~/.local/bin`;
+- asks for administrator approval when macOS enables Remote Login;
+- preserves the existing Remote Login access list and allows the current user;
+- verifies that Remote Login is on; and
+- prints that worker's exact `airlift join` command for the controller Mac.
+
 macOS always shows an administrator prompt before a script can change Remote
-Login. If you want to inspect the script first:
+Login. The whole script is readable at
+[`install-worker.sh`](https://github.com/ojaskandy/airlift/blob/main/install-worker.sh).
+To preview its actions without changing the Mac, use the same one-command flow
+with `--dry-run`:
 
 ```bash
-curl -fsSLO https://raw.githubusercontent.com/ojaskandy/airlift/main/install-worker.sh
-less install-worker.sh
-bash install-worker.sh
-```
-
-To preview every privileged action without changing the Mac:
-
-```bash
-bash install-worker.sh --dry-run
+/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/ojaskandy/airlift/main/install-worker.sh)" -- --dry-run
 ```
 
 Then run this on Dylan's MacBook Pro:
