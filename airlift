@@ -689,8 +689,8 @@ REMOTE
   IFS=$'\t' read -r busy slots load cores ready jobs machine <<<"$metrics"
   [ -n "${machine:-}" ] || machine="$AIRLIFT_ALIAS"
   score="$(
-    awk -v busy="$busy" -v slots="$slots" -v load="$load" -v cores="$cores" \
-      'BEGIN { if (slots < 1) slots = 1; if (cores < 1) cores = 1; printf "%.1f", (busy / slots) * 1000 + (load / cores) * 100 }'
+    awk -v busy="$busy" -v slots="$slots" -v load_value="$load" -v cores="$cores" \
+      'BEGIN { if (slots < 1) slots = 1; if (cores < 1) cores = 1; printf "%.1f", (busy / slots) * 1000 + (load_value / cores) * 100 }'
   )"
   printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
     "$AIRLIFT_ALIAS" "$score" "$busy" "$slots" "$load" "$cores" "$ready" "$machine" "$AIRLIFT_TRANSPORT" "$AIRLIFT_TARGET"

@@ -39,7 +39,7 @@ chmod +x "$ROOT"/tests/fakes/*
 source "$ROOT/airlift"
 [ "$(shell_quote "plain")" = "'plain'" ]
 [ "$(shell_quote "it's safe")" = "'it'\\''s safe'" ]
-[ "$(awk -v busy=2 -v slots=4 -v load=1 -v cores=8 'BEGIN { printf "%.1f", (busy / slots) * 1000 + (load / cores) * 100 }')" = "512.5" ]
+[ "$(awk -v busy=2 -v slots=4 -v load_value=1 -v cores=8 'BEGIN { printf "%.1f", (busy / slots) * 1000 + (load_value / cores) * 100 }')" = "512.5" ]
 
 mkdir -p "$METRICS_DIR"
 airlift_test setup worker@air.local --install none --no-awake >/dev/null 2>&1
