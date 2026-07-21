@@ -27,6 +27,22 @@ source "$ROOT/airlift"
 [ "$(shell_quote "plain")" = "'plain'" ]
 [ "$(shell_quote "it's safe")" = "'it'\\''s safe'" ]
 
+# The tunnel watchdog (auto-reconnect) must bake the control socket, the forward,
+# the alias, and both the health-check and reconnect ssh calls into its script,
+# generated without running the loop.
+(
+  # shellcheck disable=SC2034  # consumed by the sourced write_tunnel_watchdog
+  CONFIG_DIR="$TEMP_HOME/.config/airlift"
+  write_tunnel_watchdog "/tmp/airlift-test.sock" "3400" "3400" "spare-air"
+)
+WATCHDOG="$TEMP_HOME/.config/airlift/tunnel-watchdog.sh"
+[ -f "$WATCHDOG" ]
+grep -F "ssh -fN -M" "$WATCHDOG" >/dev/null
+grep -F "O check" "$WATCHDOG" >/dev/null
+grep -F "/tmp/airlift-test.sock" "$WATCHDOG" >/dev/null
+grep -F "127.0.0.1:" "$WATCHDOG" >/dev/null
+grep -F "spare-air" "$WATCHDOG" >/dev/null
+
 PATH="$ROOT/tests/fakes:$PATH" \
 HOME="$TEMP_HOME" \
 XDG_CONFIG_HOME="$TEMP_HOME/.config" \
@@ -46,6 +62,7 @@ PATH="$ROOT/tests/fakes:$PATH" \
 HOME="$TEMP_HOME" \
 XDG_CONFIG_HOME="$TEMP_HOME/.config" \
 AIRLIFT_TEST_OPEN_LOG="$OPEN_LOG" \
+AIRLIFT_TUNNEL_KEEPALIVE=0 \
 "$ROOT/airlift" open "~/Developer/Dylan's test project" >/dev/null
 
 grep -F "http://127.0.0.1:3400/new-session?projectId=" "$OPEN_LOG" >/dev/null
@@ -61,9 +78,13 @@ PATH="$ROOT/tests/fakes:$PATH" \
 HOME="$TEMP_HOME" \
 XDG_CONFIG_HOME="$TEMP_HOME/.config" \
 AIRLIFT_TEST_OPEN_LOG="$OPEN_LOG" \
+AIRLIFT_TUNNEL_KEEPALIVE=0 \
 "$ROOT/airlift" open >/dev/null
 
 [ "$(wc -l <"$OPEN_LOG" | tr -d ' ')" = "2" ]
+
+# open must not spawn a tunnel watchdog when keep-alive is disabled.
+[ ! -f "$TEMP_HOME/.config/airlift/tunnel-watchdog.pid" ]
 
 PATH="$ROOT/tests/fakes:$PATH" \
 HOME="$TEMP_HOME" \
@@ -113,6 +134,23 @@ grep -F "sleeps after 1 idle minutes on AC" "$DOCTOR_LOG" >/dev/null
 # Low disk headroom must be called out before a clone or build fills the disk.
 grep -F "Only 13Gi free" "$DOCTOR_LOG" >/dev/null
 grep -F "at least 25Gi" "$DOCTOR_LOG" >/dev/null
+
+# doctor must confirm the cockpit is actually serving and the tunnel is live,
+# not just that the binaries are installed.
+grep -F "serving on 127.0.0.1:3400" "$DOCTOR_LOG" >/dev/null
+grep -F "live on 127.0.0.1:3400" "$DOCTOR_LOG" >/dev/null
+
+# clone must refuse when the Air is below the disk-headroom floor (fake df
+# reports 13Gi free vs the 25Gi default), before it ever touches git.
+CLONE_LOG="$TEMP_HOME/clone.log"
+if PATH="$ROOT/tests/fakes:$PATH" \
+  HOME="$TEMP_HOME" \
+  XDG_CONFIG_HOME="$TEMP_HOME/.config" \
+  "$ROOT/airlift" clone "https://example.com/repo.git" >"$CLONE_LOG" 2>&1; then
+  printf 'clone should have refused on low disk\n' >&2
+  exit 1
+fi
+grep -F "Only 13 GiB free" "$CLONE_LOG" >/dev/null
 
 HOME="$TEMP_HOME" "$ROOT/install.sh" >/dev/null
 [ -x "$TEMP_HOME/.local/bin/airlift" ]

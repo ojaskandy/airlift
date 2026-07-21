@@ -64,6 +64,9 @@ Clone it directly on the worker:
 ./airlift open
 ```
 
+`clone` refuses if the Air has less than 25 GiB free, so a large repository can't
+fill the disk. Override the floor with `AIRLIFT_MIN_DISK_GB=<gb>`.
+
 Or open an existing Air-side checkout:
 
 ```bash
@@ -150,13 +153,30 @@ across the whole Air user, including the owner's own use of that CLI.
 
 ## Keeping the Air awake
 
-`./airlift awake` supervises its keep-awake assertion and restarts it if it dies,
-because a lone `caffeinate` is a single point of failure: if it exits, the Air
-sleeps and every running agent stops.
+`./airlift awake` registers the keep-awake assertion as a launchd agent
+(`com.airlift.keepawake`), so it **restarts after a reboot or logout**, not just
+when the assertion crashes. A lone `caffeinate` is a single point of failure: if
+it exits, the Air sleeps and every running agent stops. The launchd agent
+supervises it and re-registers on boot; where launchd is unavailable it falls
+back to a nohup supervisor. `./airlift open` re-asserts keep-awake every time, so
+the daily command is enough to keep the worker awake.
 
 `./airlift doctor` verifies the live `pmset` assertion rather than a PID file, and
-says so loudly when nothing is holding the Air awake. The assertion only holds on
-AC power, so keep the Air plugged in.
+says so loudly when nothing is holding the Air awake — and whether it will survive
+a reboot. The assertion only holds on AC power, so keep the Air plugged in.
+`./airlift sleep` bootouts the agent and removes the plist, so keep-awake stays
+off until you run `awake` again.
+
+## Staying connected
+
+The `open` tunnel is supervised by a Pro-side watchdog: if the Air sleeps or
+Wi-Fi drops, the watchdog re-establishes the SSH forward automatically (within
+~15 seconds), so `127.0.0.1:3400` keeps working without re-running `open`.
+`./airlift stop` (or `shutdown`) stops the watchdog along with the tunnel. Opt out
+with `AIRLIFT_TUNNEL_KEEPALIVE=0`.
+
+`./airlift doctor` reports whether the cockpit is actually serving on the Air and
+whether the Pro → Air tunnel is live, not just that the binaries are installed.
 
 ## Security defaults
 
