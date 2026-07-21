@@ -21,6 +21,7 @@ chmod +x "$ROOT"/tests/fakes/*
 
 "$ROOT/airlift" --version | grep -F "airlift "
 "$ROOT/airlift" --help | grep -F "Airlift"
+"$ROOT/airlift" --help | grep -F "airlift model"
 
 # shellcheck disable=SC1091
 source "$ROOT/airlift"
@@ -151,6 +152,18 @@ if PATH="$ROOT/tests/fakes:$PATH" \
   exit 1
 fi
 grep -F "Only 13 GiB free" "$CLONE_LOG" >/dev/null
+
+# `airlift model` arg validation is hermetic (fails before any network call).
+if PATH="$ROOT/tests/fakes:$PATH" HOME="$TEMP_HOME" XDG_CONFIG_HOME="$TEMP_HOME/.config" \
+  "$ROOT/airlift" model --effort >/dev/null 2>&1; then
+  printf 'model --effort (no value) should have failed\n' >&2
+  exit 1
+fi
+if PATH="$ROOT/tests/fakes:$PATH" HOME="$TEMP_HOME" XDG_CONFIG_HOME="$TEMP_HOME/.config" \
+  "$ROOT/airlift" model --bogus >/dev/null 2>&1; then
+  printf 'model --bogus should have failed\n' >&2
+  exit 1
+fi
 
 HOME="$TEMP_HOME" "$ROOT/install.sh" >/dev/null
 [ -x "$TEMP_HOME/.local/bin/airlift" ]

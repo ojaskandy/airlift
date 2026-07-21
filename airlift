@@ -2,7 +2,7 @@
 
 set -euo pipefail
 
-VERSION="0.4.0"
+VERSION="0.5.0"
 # Minimum free disk on the Air before cloning a repository and building is safe.
 MIN_DISK_GB="${AIRLIFT_MIN_DISK_GB:-25}"
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/airlift"
@@ -56,6 +56,7 @@ Airlift — run engineering agents on a spare Mac over SSH.
 Usage:
   airlift setup <user@mac-host> [--alias spare-air] [--install cockpit|codex|claude|none] [--no-awake]
   airlift open [remote-project] [--local-port 3400] [--remote-port 3400]
+  airlift model [model] [--effort xhigh] [--thinking off]   Default model for new sessions
   airlift clone <git-url> [remote-directory]
   airlift login [codex|claude]
   airlift shell
@@ -1294,6 +1295,128 @@ SSH key:      $KEY_FILE
 EOF
 }
 
+model_cmd() {
+  load_config
+  require ssh
+
+  local model="" effort="" thinking="" provider="claude" set_any=0
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --effort) [ "$#" -ge 2 ] || die "--effort needs a value."; effort="$2"; set_any=1; shift 2 ;;
+      --thinking) [ "$#" -ge 2 ] || die "--thinking needs a value."; thinking="$2"; set_any=1; shift 2 ;;
+      --provider) [ "$#" -ge 2 ] || die "--provider needs a value."; provider="$2"; shift 2 ;;
+      -*) die "Unknown model option: $1" ;;
+      *) [ -z "$model" ] || die "Give only one model."; model="$1"; set_any=1; shift ;;
+    esac
+  done
+
+  local qmodel qeffort qthinking qprovider qport out_tmp
+  qmodel="$(shell_quote "$model")"
+  qeffort="$(shell_quote "$effort")"
+  qthinking="$(shell_quote "$thinking")"
+  qprovider="$(shell_quote "$provider")"
+  qport="$(shell_quote "$AIRLIFT_REMOTE_PORT")"
+  out_tmp="$(mktemp "${TMPDIR:-/tmp}/airlift-model.XXXXXX")"
+
+  # Runs on the Air against the cockpit's loopback API, so it works whether or
+  # not the Pro tunnel is up. Read-modify-write: preserves every existing
+  # newSessionDefaults field (the API merges only at the top level).
+  ssh "$AIRLIFT_ALIAS" \
+    "AIRLIFT_MODEL=$qmodel AIRLIFT_EFFORT=$qeffort AIRLIFT_THINKING=$qthinking AIRLIFT_PROVIDER=$qprovider AIRLIFT_PORT=$qport AIRLIFT_SET=$set_any bash -s" \
+    <<'REMOTE' >"$out_tmp" 2>&1 || true
+set -eu
+export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$HOME/.codex/bin:$PATH"
+command -v node >/dev/null 2>&1 || { echo "__ERR__ node not found on the Air"; exit 0; }
+node -e '
+const base = `http://127.0.0.1:${process.env.AIRLIFT_PORT}`;
+const provider = process.env.AIRLIFT_PROVIDER || "claude";
+const model = process.env.AIRLIFT_MODEL || "";
+const effort = process.env.AIRLIFT_EFFORT || "";
+const thinking = process.env.AIRLIFT_THINKING || "";
+const doSet = process.env.AIRLIFT_SET === "1";
+const jget = async (p) => { const r = await fetch(base + p); if (!r.ok) throw new Error("HTTP " + r.status); return r.json(); };
+(async () => {
+  let resp;
+  try { resp = await jget("/api/settings"); } catch (e) { console.log("__UNREACHABLE__"); return; }
+  const settings = resp.settings || resp;
+  const cur = settings.newSessionDefaults || {};
+  let models = [];
+  try {
+    const provs = await jget("/api/providers");
+    const arr = Array.isArray(provs) ? provs : (provs.providers || []);
+    const p = arr.find((x) => x.name === provider);
+    models = p ? (p.models || []).map((m) => m.id) : [];
+  } catch (e) {}
+
+  if (!doSet) {
+    const pd = (cur.providers && cur.providers[provider]) || {};
+    console.log("__SHOW__");
+    console.log("  provider: " + (cur.provider || "(unset)"));
+    console.log("  model:    " + (pd.model || cur.model || "(unset — cockpit picks the first available)"));
+    console.log("  effort:   " + (pd.effortLevel || "(unset)"));
+    console.log("  thinking: " + (pd.thinkingMode || "(unset)"));
+    console.log("  available " + provider + " models: " + (models.length ? models.join(", ") : "(none reported)"));
+    return;
+  }
+
+  if (model && models.length && !models.includes(model)) {
+    console.log("__BADMODEL__");
+    console.log("  available " + provider + " models: " + models.join(", "));
+    return;
+  }
+
+  const nsd = JSON.parse(JSON.stringify(cur));
+  nsd.provider = provider;
+  nsd.providers = nsd.providers || {};
+  const pd = { ...(nsd.providers[provider] || {}) };
+  if (model) pd.model = model;
+  if (effort) pd.effortLevel = effort;
+  if (thinking) pd.thinkingMode = thinking;
+  nsd.providers[provider] = pd;
+
+  const put = await fetch(base + "/api/settings", {
+    method: "PUT",
+    headers: { "Content-Type": "application/json", "X-Yep-Anywhere": "true" },
+    body: JSON.stringify({ newSessionDefaults: nsd }),
+  });
+  if (!put.ok) { console.log("__ERR__ HTTP " + put.status + " " + (await put.text()).slice(0, 120)); return; }
+  const saved = await put.json();
+  const savedNsd = (saved.settings || saved).newSessionDefaults || nsd;
+  const sp = (savedNsd.providers || {})[provider] || pd;
+  console.log("__OK__ " + provider + " / " + (sp.model || "(cockpit default)") +
+    (sp.effortLevel ? "  effort=" + sp.effortLevel : "") +
+    (sp.thinkingMode ? "  thinking=" + sp.thinkingMode : ""));
+})().catch((e) => { console.log("__ERR__ " + e.message); });
+'
+REMOTE
+
+  local out
+  out="$(cat "$out_tmp" 2>/dev/null || true)"
+  rm -f "$out_tmp"
+
+  case "$out" in
+    *__UNREACHABLE__*)
+      die "Cockpit is not reachable on the Air. Start it first: airlift open" ;;
+    *__ERR__*)
+      die "Could not update the default model:${out##*__ERR__}" ;;
+    *__BADMODEL__*)
+      warn "That model isn't available for provider '$provider'."
+      printf '%s\n' "$out" | grep -E '^  available'
+      exit 1 ;;
+    *__SHOW__*)
+      say "${BOLD}Default new-session model${RESET}"
+      printf '%s\n' "$out" | grep -vF '__SHOW__'
+      say ""
+      say "${DIM}Change it: airlift model <model> [--effort xhigh] [--thinking off]${RESET}" ;;
+    *__OK__*)
+      ok "New sessions now start with:${out##*__OK__}"
+      say "${DIM}Applies to new cockpit sessions; already-open sessions keep their model.${RESET}" ;;
+    *)
+      die "Unexpected response updating the model:
+$out" ;;
+  esac
+}
+
 main() {
   local command="${1:-help}"
   if [ "$#" -gt 0 ]; then
@@ -1304,6 +1427,7 @@ main() {
     setup) setup_cmd "$@" ;;
     open|cockpit|web|codex|claude) cockpit_cmd "$@" ;;
     clone) clone_cmd "$@" ;;
+    model) model_cmd "$@" ;;
     login) login_cmd "$@" ;;
     shell|ssh) shell_cmd "$@" ;;
     awake) awake_cmd "$@" ;;

@@ -178,6 +178,20 @@ with `AIRLIFT_TUNNEL_KEEPALIVE=0`.
 `./airlift doctor` reports whether the cockpit is actually serving on the Air and
 whether the Pro → Air tunnel is live, not just that the binaries are installed.
 
+## Choosing the session model
+
+Set the model new sessions start with, once, instead of picking it every time:
+
+```bash
+./airlift model                       # show the current default + available models
+./airlift model opus --effort xhigh   # new sessions start on Opus, extra-high effort
+./airlift model sonnet                # switch the default; other settings untouched
+```
+
+It writes the cockpit's `newSessionDefaults` (a read-modify-write, so your
+permission mode, thinking, and other session defaults are preserved). Already-open
+sessions keep their model. `--thinking` and `--provider` are also accepted.
+
 ## Security defaults
 
 - OpenSSH is the only network entry point.
