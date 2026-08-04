@@ -2,7 +2,9 @@
 
 set -euo pipefail
 
-VERSION="0.2.0"
+VERSION="0.5.0"
+# Minimum free disk on the Air before cloning a repository and building is safe.
+MIN_DISK_GB="${AIRLIFT_MIN_DISK_GB:-25}"
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/airlift"
 CONFIG_FILE="$CONFIG_DIR/config"
 KEY_FILE="$HOME/.ssh/airlift_ed25519"
@@ -54,6 +56,7 @@ Airlift — run engineering agents on a spare Mac over SSH.
 Usage:
   airlift setup <user@mac-host> [--alias spare-air] [--install cockpit|codex|claude|none] [--no-awake]
   airlift open [remote-project] [--local-port 3400] [--remote-port 3400]
+  airlift model [model] [--effort xhigh] [--thinking off]   Default model for new sessions
   airlift clone <git-url> [remote-directory]
   airlift login [codex|claude]
   airlift shell
@@ -467,7 +470,85 @@ setup_cmd() {
   say "  ${BOLD}./airlift open '~/Developer/your-project'${RESET}"
 }
 
+tunnel_watchdog_script() { printf '%s/tunnel-watchdog.sh' "$CONFIG_DIR"; }
+tunnel_watchdog_pid_file() { printf '%s/tunnel-watchdog.pid' "$CONFIG_DIR"; }
+tunnel_watchdog_stop_file() { printf '%s/tunnel-watchdog.stop' "$CONFIG_DIR"; }
+
+# Generate the Pro-side watchdog that re-establishes the SSH forward when the
+# master dies (Air slept, Wi-Fi blipped). Split out so it can be unit-tested
+# without spawning the loop. Args: socket local_port remote_port alias.
+write_tunnel_watchdog() {
+  local socket="$1" local_port="$2" remote_port="$3" alias="$4"
+  local script stop
+  script="$(tunnel_watchdog_script)"
+  stop="$(tunnel_watchdog_stop_file)"
+  mkdir -p "$CONFIG_DIR"
+  chmod 700 "$CONFIG_DIR"
+  umask 077
+  cat >"$script" <<EOF
+#!/bin/bash
+set -u
+socket=$(shell_quote "$socket")
+stop_file=$(shell_quote "$stop")
+alias=$(shell_quote "$alias")
+interval="\${AIRLIFT_TUNNEL_CHECK_INTERVAL:-15}"
+
+reconnect() {
+  rm -f "\$socket"
+  ssh -fN -M -S "\$socket" \\
+    -o ExitOnForwardFailure=yes \\
+    -o ControlPersist=no \\
+    -o ConnectTimeout=8 \\
+    -L $(shell_quote "$local_port"):127.0.0.1:$(shell_quote "$remote_port") \\
+    "\$alias" >/dev/null 2>&1 || true
+}
+
+while :; do
+  [ -f "\$stop_file" ] && break
+  if ! ssh -S "\$socket" -O check "\$alias" >/dev/null 2>&1; then
+    reconnect
+  fi
+  sleep "\$interval"
+done
+rm -f "\$socket"
+EOF
+  chmod 700 "$script"
+}
+
+start_tunnel_watchdog() {
+  # Args: socket local_port remote_port. Opt out with AIRLIFT_TUNNEL_KEEPALIVE=0.
+  [ "${AIRLIFT_TUNNEL_KEEPALIVE:-1}" = "1" ] || return 0
+  stop_tunnel_watchdog
+  local script pidf stop
+  script="$(tunnel_watchdog_script)"
+  pidf="$(tunnel_watchdog_pid_file)"
+  stop="$(tunnel_watchdog_stop_file)"
+  rm -f "$stop"
+  write_tunnel_watchdog "$1" "$2" "$3" "$AIRLIFT_ALIAS"
+  mkdir -p "$CONFIG_DIR/logs"
+  nohup /bin/bash "$script" >>"$CONFIG_DIR/logs/tunnel-watchdog.log" 2>&1 </dev/null &
+  printf '%s\n' "$!" >"$pidf"
+}
+
+stop_tunnel_watchdog() {
+  local pidf stop pid
+  pidf="$(tunnel_watchdog_pid_file)"
+  stop="$(tunnel_watchdog_stop_file)"
+  : >"$stop" 2>/dev/null || true
+  if [ -f "$pidf" ]; then
+    pid="$(cat "$pidf" 2>/dev/null || true)"
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+      case "$(ps -p "$pid" -o command= 2>/dev/null || true)" in
+        *tunnel-watchdog.sh*) kill "$pid" 2>/dev/null || true ;;
+      esac
+    fi
+    rm -f "$pidf"
+  fi
+  rm -f "$stop" 2>/dev/null || true
+}
+
 stop_tunnel_only() {
+  stop_tunnel_watchdog
   local socket
   socket="$(ssh_socket)"
   if [ -S "$socket" ]; then
@@ -653,10 +734,16 @@ REMOTE
   ssh -fN -M -S "$socket" \
     -o ExitOnForwardFailure=yes \
     -o ControlPersist=no \
+    -o ConnectTimeout=8 \
     -L "$local_port:127.0.0.1:$remote_port" \
     "$AIRLIFT_ALIAS"
 
   ok "Private tunnel is live: MacBook Pro → MacBook Air"
+
+  # Keep the tunnel up across Air sleeps / Wi-Fi drops, and make sure the Air is
+  # holding a keep-awake assertion (idempotent: a no-op if already awake).
+  start_tunnel_watchdog "$socket" "$local_port" "$remote_port"
+  keepawake_ensure quiet
   local url="http://127.0.0.1:$local_port"
   if [ "$project" != "~" ]; then
     local project_id
@@ -687,6 +774,34 @@ clone_cmd() {
   local quoted_url quoted_destination
   quoted_url="$(shell_quote "$url")"
   quoted_destination="$(shell_quote "$destination")"
+
+  # Honor the documented disk-headroom floor before a clone can fill the Air.
+  # Capture via temp file (not $(ssh ... <<HEREDOC)) for bash 3.2, see keepawake_ensure.
+  local quoted_min_disk free_status disk_tmp
+  quoted_min_disk="$(shell_quote "$MIN_DISK_GB")"
+  disk_tmp="$(mktemp "${TMPDIR:-/tmp}/airlift-disk.XXXXXX")"
+  ssh "$AIRLIFT_ALIAS" "AIRLIFT_MIN_DISK_GB=$quoted_min_disk bash -s" <<'REMOTE' >"$disk_tmp" 2>/dev/null || true
+set -eu
+free="$(df -g "$HOME" 2>/dev/null | awk 'NR == 2 { print $4 }')"
+case "$free" in
+  ''|*[!0-9]*) printf 'unknown\n' ;;
+  *)
+    if [ "$free" -lt "$AIRLIFT_MIN_DISK_GB" ]; then
+      printf 'low %s\n' "$free"
+    else
+      printf 'ok %s\n' "$free"
+    fi
+    ;;
+esac
+REMOTE
+  free_status="$(cat "$disk_tmp" 2>/dev/null || true)"
+  rm -f "$disk_tmp"
+
+  case "$free_status" in
+    low\ *)
+      die "Only ${free_status#low } GiB free on the Air; need ${MIN_DISK_GB} GiB to clone and build safely. Free space, or override: AIRLIFT_MIN_DISK_GB=<gb> airlift clone …"
+      ;;
+  esac
 
   info "Cloning $url on the Air…"
   ssh "$AIRLIFT_ALIAS" "AIRLIFT_URL=$quoted_url AIRLIFT_DEST=$quoted_destination bash -s" <<'REMOTE'
@@ -728,44 +843,179 @@ shell_cmd() {
   exec ssh "$AIRLIFT_ALIAS"
 }
 
-awake_cmd() {
-  load_config
-  ssh "$AIRLIFT_ALIAS" "bash -s" <<'REMOTE'
+keepawake_ensure() {
+  # Ensure the Air holds a supervised keep-awake assertion. Prefers a launchd
+  # LaunchAgent (survives reboot/logout); falls back to a nohup supervisor.
+  # Idempotent, safe to call on every `open`. Pass "quiet" to suppress chatter.
+  local quiet="${1:-}"
+  local use_launchd quoted_launchd method tmp
+  use_launchd="${AIRLIFT_USE_LAUNCHD:-1}"
+  # Capture the remote output via a temp file, not $(ssh … <<HEREDOC): bash 3.2
+  # (macOS /bin/bash) mis-parses a here-doc nested inside a command substitution.
+  quoted_launchd="$(shell_quote "$use_launchd")"
+  tmp="$(mktemp "${TMPDIR:-/tmp}/airlift-awake.XXXXXX")"
+  ssh "$AIRLIFT_ALIAS" "AIRLIFT_USE_LAUNCHD=$quoted_launchd bash -s" <<'REMOTE' >"$tmp" 2>/dev/null || true
 set -eu
-mkdir -p "$HOME/.airlift/logs"
-pid_file="$HOME/.airlift/caffeinate.pid"
+mkdir -p "$HOME/.airlift/logs" "$HOME/Library/LaunchAgents"
+label="com.airlift.keepawake"
+plist="$HOME/Library/LaunchAgents/$label.plist"
+script_file="$HOME/.airlift/keepawake.sh"
+stop_file="$HOME/.airlift/keepawake.stop"
+supervisor_pid_file="$HOME/.airlift/keepawake.pid"
 
-if [ -f "$pid_file" ]; then
-  pid="$(cat "$pid_file" 2>/dev/null || true)"
+# The supervisor respawns `caffeinate -s` if it exits, and records its own pid so
+# doctor can see it whether launchd or nohup started it. A bare caffeinate is a
+# single point of failure; supervising it means a dead assertion self-heals.
+cat >"$script_file" <<'SUPERVISOR'
+#!/bin/bash
+set -u
+
+stop_file="$HOME/.airlift/keepawake.stop"
+caffeinate_pid_file="$HOME/.airlift/caffeinate.pid"
+caffeinate_pid=""
+
+printf '%s\n' "$$" >"$HOME/.airlift/keepawake.pid"
+
+shut_down() {
+  if [ -n "$caffeinate_pid" ]; then
+    kill "$caffeinate_pid" 2>/dev/null || true
+  fi
+  rm -f "$caffeinate_pid_file"
+  exit 0
+}
+
+trap shut_down TERM INT
+
+if [ ! -x /usr/bin/caffeinate ]; then
+  printf 'caffeinate not found; keep-awake cannot run on this host\n' >&2
+  exit 1
+fi
+
+while :; do
+  [ -f "$stop_file" ] && break
+  /usr/bin/caffeinate -s &
+  caffeinate_pid=$!
+  printf '%s\n' "$caffeinate_pid" >"$caffeinate_pid_file"
+  wait "$caffeinate_pid" 2>/dev/null || true
+  caffeinate_pid=""
+  [ -f "$stop_file" ] && break
+  printf '%s keep-awake assertion exited; restarting\n' \
+    "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+  sleep 2
+done
+
+rm -f "$caffeinate_pid_file"
+SUPERVISOR
+
+chmod 700 "$script_file"
+rm -f "$stop_file"
+uid="$(id -u)"
+
+# Prefer launchd so keep-awake survives a reboot/logout, not just a crash.
+if [ "${AIRLIFT_USE_LAUNCHD:-1}" = "1" ] && command -v launchctl >/dev/null 2>&1; then
+  cat >"$plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>$label</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>$script_file</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ProcessType</key><string>Background</string>
+  <key>StandardOutPath</key><string>$HOME/.airlift/logs/keepawake.log</string>
+  <key>StandardErrorPath</key><string>$HOME/.airlift/logs/keepawake.log</string>
+</dict>
+</plist>
+PLIST
+  if launchctl print "gui/$uid/$label" >/dev/null 2>&1; then
+    launchctl kickstart "gui/$uid/$label" >/dev/null 2>&1 || true
+    printf 'launchd\n'
+    exit 0
+  fi
+  launchctl bootout "gui/$uid/$label" >/dev/null 2>&1 || true
+  if launchctl bootstrap "gui/$uid" "$plist" >/dev/null 2>&1; then
+    printf 'launchd\n'
+    exit 0
+  fi
+  # Bootstrap failed (e.g. no active GUI session); fall through to nohup.
+fi
+
+if [ -f "$supervisor_pid_file" ]; then
+  pid="$(cat "$supervisor_pid_file" 2>/dev/null || true)"
   if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
-    command_line="$(ps -p "$pid" -o command= 2>/dev/null || true)"
-    case "$command_line" in
-      *caffeinate*) exit 0 ;;
+    case "$(ps -p "$pid" -o command= 2>/dev/null || true)" in
+      *keepawake.sh*) printf 'nohup\n'; exit 0 ;;
     esac
   fi
 fi
-
-nohup /usr/bin/caffeinate -s >"$HOME/.airlift/logs/caffeinate.log" 2>&1 </dev/null &
-printf '%s\n' "$!" >"$pid_file"
+nohup /bin/bash "$script_file" >>"$HOME/.airlift/logs/keepawake.log" 2>&1 </dev/null &
+printf '%s\n' "$!" >"$supervisor_pid_file"
+printf 'nohup\n'
 REMOTE
-  ok "The Air will stay awake while connected to AC power."
+  method="$(cat "$tmp" 2>/dev/null || true)"
+  rm -f "$tmp"
+
+  [ "$quiet" = "quiet" ] && return 0
+
+  case "$method" in
+    launchd)
+      ok "The Air will stay awake on AC power; keep-awake auto-starts after a reboot (launchd)."
+      ;;
+    nohup)
+      ok "The Air will stay awake while connected to AC power."
+      say "${DIM}Supervised, but not registered with launchd, so it won't restart after an Air reboot.${RESET}"
+      ;;
+    *)
+      warn "Could not confirm keep-awake started. Check: airlift doctor"
+      ;;
+  esac
+  say "${DIM}Verify any time with: airlift doctor${RESET}"
+}
+
+awake_cmd() {
+  load_config
+  keepawake_ensure ""
 }
 
 sleep_cmd() {
   load_config
   ssh "$AIRLIFT_ALIAS" "bash -s" <<'REMOTE'
 set -eu
-pid_file="$HOME/.airlift/caffeinate.pid"
-if [ -f "$pid_file" ]; then
+stop_file="$HOME/.airlift/keepawake.stop"
+: >"$stop_file"
+
+# Tear down the launchd agent first: bootout stops the job (so KeepAlive can't
+# restart it) and removing the plist stops it auto-loading on the next reboot.
+label="com.airlift.keepawake"
+plist="$HOME/Library/LaunchAgents/$label.plist"
+if command -v launchctl >/dev/null 2>&1; then
+  launchctl bootout "gui/$(id -u)/$label" >/dev/null 2>&1 || true
+fi
+rm -f "$plist"
+
+stop_pid_file() {
+  pid_file="$1"
+  pattern="$2"
+  [ -f "$pid_file" ] || return 0
   pid="$(cat "$pid_file" 2>/dev/null || true)"
   if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
     command_line="$(ps -p "$pid" -o command= 2>/dev/null || true)"
     case "$command_line" in
-      *caffeinate*) kill "$pid" 2>/dev/null || true ;;
+      *"$pattern"*) kill "$pid" 2>/dev/null || true ;;
     esac
   fi
   rm -f "$pid_file"
-fi
+}
+
+# Stop the supervisor first so it does not restart the assertion we are killing.
+stop_pid_file "$HOME/.airlift/keepawake.pid" keepawake.sh
+stop_pid_file "$HOME/.airlift/caffeinate.pid" caffeinate
+rm -f "$stop_file"
 REMOTE
   ok "Released Airlift's keep-awake assertion."
 }
@@ -786,22 +1036,114 @@ doctor_cmd() {
     exit 1
   fi
 
-  ssh "$AIRLIFT_ALIAS" "bash -s" <<'REMOTE'
+  local quoted_min_disk quoted_port
+  quoted_min_disk="$(shell_quote "$MIN_DISK_GB")"
+  quoted_port="$(shell_quote "$AIRLIFT_REMOTE_PORT")"
+
+  ssh "$AIRLIFT_ALIAS" "AIRLIFT_MIN_DISK_GB=$quoted_min_disk AIRLIFT_PORT=$quoted_port bash -s" <<'REMOTE'
 set -u
 export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$HOME/.codex/bin:$PATH"
+
+# Which ChatGPT account Codex would spend quota as. Reads only the identity
+# claims of the local id_token; never prints tokens.
+codex_identity() {
+  auth_file="$HOME/.codex/auth.json"
+  [ -f "$auth_file" ] || return 1
+  command -v node >/dev/null 2>&1 || return 1
+  node -e '
+    const fs = require("fs");
+    try {
+      const auth = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+      const token = auth.tokens && auth.tokens.id_token;
+      if (!token) {
+        process.stdout.write(auth.OPENAI_API_KEY ? "api-key" : "");
+        process.exit(0);
+      }
+      const claims = JSON.parse(
+        Buffer.from(token.split(".")[1], "base64url").toString("utf8")
+      );
+      process.stdout.write(claims.email || "");
+    } catch (error) {
+      process.exit(1);
+    }
+  ' "$auth_file" 2>/dev/null
+}
+
+codex_plan() {
+  auth_file="$HOME/.codex/auth.json"
+  [ -f "$auth_file" ] || return 1
+  command -v node >/dev/null 2>&1 || return 1
+  node -e '
+    const fs = require("fs");
+    try {
+      const auth = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+      const token = auth.tokens && auth.tokens.id_token;
+      if (!token) process.exit(0);
+      const claims = JSON.parse(
+        Buffer.from(token.split(".")[1], "base64url").toString("utf8")
+      );
+      const detail = claims["https://api.openai.com/auth"] || {};
+      process.stdout.write(detail.chatgpt_plan_type || "");
+    } catch (error) {
+      process.exit(1);
+    }
+  ' "$auth_file" 2>/dev/null
+}
+
+claude_field() {
+  command -v node >/dev/null 2>&1 || return 1
+  claude auth status 2>/dev/null | node -e '
+    let raw = "";
+    process.stdin.on("data", (chunk) => (raw += chunk));
+    process.stdin.on("end", () => {
+      try {
+        process.stdout.write(String(JSON.parse(raw)[process.argv[1]] || ""));
+      } catch (error) {
+        process.exit(1);
+      }
+    });
+  ' "$1" 2>/dev/null
+}
 
 printf '\nRemote machine\n'
 printf '  Name:    %s\n' "$(scutil --get ComputerName 2>/dev/null || hostname)"
 printf '  macOS:   %s\n' "$(sw_vers -productVersion 2>/dev/null || printf unknown)"
 printf '  Chip:    %s\n' "$(uname -m)"
 printf '  Shell:   %s\n' "${SHELL:-unknown}"
-printf '  Disk:    %s\n' "$(df -h "$HOME" | awk 'NR == 2 { print $4 " free" }')"
+
+disk_free_gb="$(df -g "$HOME" 2>/dev/null | awk 'NR == 2 { print $4 }')"
+printf '  Disk:    %s (%s used)\n' \
+  "$(df -h "$HOME" | awk 'NR == 2 { print $4 " free" }')" \
+  "$(df -h "$HOME" | awk 'NR == 2 { print $5 }')"
+case "$disk_free_gb" in
+  ''|*[!0-9]*) ;;
+  *)
+    if [ "$disk_free_gb" -lt "$AIRLIFT_MIN_DISK_GB" ]; then
+      printf '  ! Only %sGi free. Airlift wants at least %sGi to clone and build safely.\n' \
+        "$disk_free_gb" "$AIRLIFT_MIN_DISK_GB"
+      printf '    Cloning a large repository or running a build may fail or fill the disk.\n'
+    fi
+    ;;
+esac
 
 printf '\nAgents\n'
+codex_account=""
+claude_account=""
+
 if command -v codex >/dev/null 2>&1; then
   printf '  Codex:   %s\n' "$(codex --version 2>/dev/null)"
   if codex login status >/dev/null 2>&1; then
-    printf '  Auth:    ready\n'
+    codex_account="$(codex_identity || true)"
+    codex_plan_name="$(codex_plan || true)"
+    if [ -n "$codex_account" ]; then
+      if [ -n "$codex_plan_name" ]; then
+        printf '  Auth:    %s (%s)\n' "$codex_account" "$codex_plan_name"
+      else
+        printf '  Auth:    %s\n' "$codex_account"
+      fi
+    else
+      printf '  Auth:    ready (account could not be identified)\n'
+    fi
   else
     printf '  Auth:    sign-in required\n'
   fi
@@ -812,7 +1154,17 @@ fi
 if command -v claude >/dev/null 2>&1; then
   printf '  Claude:  %s\n' "$(claude --version 2>/dev/null)"
   if claude auth status >/dev/null 2>&1; then
-    printf '  Auth:    ready\n'
+    claude_account="$(claude_field email || true)"
+    claude_plan="$(claude_field subscriptionType || true)"
+    if [ -n "$claude_account" ]; then
+      if [ -n "$claude_plan" ]; then
+        printf '  Auth:    %s (%s)\n' "$claude_account" "$claude_plan"
+      else
+        printf '  Auth:    %s\n' "$claude_account"
+      fi
+    else
+      printf '  Auth:    ready (account could not be identified)\n'
+    fi
   else
     printf '  Auth:    sign-in required\n'
   fi
@@ -821,25 +1173,110 @@ else
 fi
 
 if command -v yepanywhere >/dev/null 2>&1; then
-  printf '  Cockpit: yepanywhere %s\n' "$(yepanywhere --version 2>/dev/null)"
+  cockpit_version="$(yepanywhere --version 2>/dev/null)"
+  if curl -fsS "http://127.0.0.1:$AIRLIFT_PORT/api/version" 2>/dev/null |
+    grep -F '"current"' >/dev/null 2>&1; then
+    printf '  Cockpit: yepanywhere %s (serving on 127.0.0.1:%s)\n' \
+      "$cockpit_version" "$AIRLIFT_PORT"
+  else
+    printf '  Cockpit: yepanywhere %s (installed, not serving. Run: airlift open)\n' \
+      "$cockpit_version"
+  fi
 else
   printf '  Cockpit: not installed\n'
 fi
 
+# The cockpit's provider picker spends whichever account each agent is signed in
+# as. Different accounts means one of them is not yours.
+if [ -n "$codex_account" ] && [ -n "$claude_account" ] &&
+  [ "$codex_account" != "$claude_account" ]; then
+  printf '\n  ! Codex and Claude are signed in as DIFFERENT accounts.\n'
+  printf '      Codex:  %s\n' "$codex_account"
+  printf '      Claude: %s\n' "$claude_account"
+  printf '    Choosing Codex in the cockpit spends %s quota, under that identity.\n' \
+    "$codex_account"
+  printf '    Fix with: airlift login codex\n'
+fi
+
 printf '\nPower\n'
 if command -v pmset >/dev/null 2>&1; then
-  pmset -g custom 2>/dev/null | awk '
-    /AC Power/ { ac = 1; next }
-    ac && / sleep / { print "  AC sleep:" $2 " minutes"; exit }
-  '
+  ac_sleep="$(
+    pmset -g custom 2>/dev/null |
+      awk '/AC Power/ { ac = 1; next } ac && / sleep / { print $2; exit }'
+  )"
+  [ -n "$ac_sleep" ] && printf '  AC sleep:   %s minutes when idle and unheld\n' "$ac_sleep"
+  power_source="$(
+    pmset -g batt 2>/dev/null | awk -F "'" '/Now drawing/ { print $2; exit }'
+  )"
+  [ -n "$power_source" ] && printf '  Source:     %s\n' "$power_source"
 fi
-if [ -f "$HOME/.airlift/caffeinate.pid" ]; then
-  caffeinate_pid="$(cat "$HOME/.airlift/caffeinate.pid" 2>/dev/null || true)"
-  if [ -n "$caffeinate_pid" ] && kill -0 "$caffeinate_pid" 2>/dev/null; then
-    printf '  Airlift: keep-awake active on AC power\n'
+
+# Ground truth is the pmset assertion, not the pid file: a pid can be alive
+# while holding no assertion, and caffeinate -s only holds on AC power.
+supervised=0
+if [ -f "$HOME/.airlift/keepawake.pid" ]; then
+  supervisor_pid="$(cat "$HOME/.airlift/keepawake.pid" 2>/dev/null || true)"
+  if [ -n "$supervisor_pid" ] && kill -0 "$supervisor_pid" 2>/dev/null; then
+    case "$(ps -p "$supervisor_pid" -o command= 2>/dev/null || true)" in
+      *keepawake.sh*) supervised=1 ;;
+    esac
   fi
 fi
+
+# launchd management means keep-awake also survives a reboot, not just a crash.
+launchd_managed=0
+if command -v launchctl >/dev/null 2>&1; then
+  if launchctl print "gui/$(id -u)/com.airlift.keepawake" >/dev/null 2>&1; then
+    launchd_managed=1
+  fi
+fi
+
+asserted=0
+if [ -f "$HOME/.airlift/caffeinate.pid" ] && command -v pmset >/dev/null 2>&1; then
+  caffeinate_pid="$(cat "$HOME/.airlift/caffeinate.pid" 2>/dev/null || true)"
+  if [ -n "$caffeinate_pid" ] && kill -0 "$caffeinate_pid" 2>/dev/null; then
+    if pmset -g assertions 2>/dev/null |
+      grep -F "pid $caffeinate_pid(caffeinate)" >/dev/null 2>&1; then
+      asserted=1
+    fi
+  fi
+fi
+
+if [ "$asserted" -eq 1 ] && [ "$launchd_managed" -eq 1 ]; then
+  printf '  Keep-awake: active and supervised by launchd (survives reboot)\n'
+elif [ "$asserted" -eq 1 ] && [ "$supervised" -eq 1 ]; then
+  printf '  Keep-awake: active and supervised (restarts if it dies)\n'
+  printf '  ! Not registered with launchd, will NOT restart after an Air reboot. Run: airlift awake\n'
+elif [ "$asserted" -eq 1 ]; then
+  printf '  Keep-awake: active, NOT supervised\n'
+  printf '  ! If this assertion dies the Air sleeps and all remote work stops.\n'
+  printf '    Re-run: airlift awake\n'
+else
+  printf '  Keep-awake: NOT ACTIVE\n'
+  printf '  ! Airlift is holding no keep-awake assertion.\n'
+  if [ -n "${ac_sleep:-}" ] && [ "${ac_sleep:-0}" != "0" ]; then
+    printf '    The Air sleeps after %s idle minutes on AC and all remote work stops.\n' \
+      "$ac_sleep"
+  fi
+  printf '    Start it with: airlift awake\n'
+fi
+
+case "${power_source:-}" in
+  *Battery*)
+    printf '  ! On battery power. caffeinate -s only holds on AC.\n'
+    printf '    Plug the Air in to keep agents running.\n'
+    ;;
+esac
 REMOTE
+
+  if curl -fsS "http://127.0.0.1:$AIRLIFT_LOCAL_PORT/api/version" 2>/dev/null |
+    grep -F '"current"' >/dev/null 2>&1; then
+    say ""
+    say "Tunnel:   live on 127.0.0.1:$AIRLIFT_LOCAL_PORT (Pro → Air)"
+  else
+    say ""
+    say "Tunnel:   down. Run: airlift open"
+  fi
 
   say ""
   say "Security: SSH key only, agent forwarding disabled, cockpit bound to Air loopback."
@@ -858,6 +1295,128 @@ SSH key:      $KEY_FILE
 EOF
 }
 
+model_cmd() {
+  load_config
+  require ssh
+
+  local model="" effort="" thinking="" provider="claude" set_any=0
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --effort) [ "$#" -ge 2 ] || die "--effort needs a value."; effort="$2"; set_any=1; shift 2 ;;
+      --thinking) [ "$#" -ge 2 ] || die "--thinking needs a value."; thinking="$2"; set_any=1; shift 2 ;;
+      --provider) [ "$#" -ge 2 ] || die "--provider needs a value."; provider="$2"; shift 2 ;;
+      -*) die "Unknown model option: $1" ;;
+      *) [ -z "$model" ] || die "Give only one model."; model="$1"; set_any=1; shift ;;
+    esac
+  done
+
+  local qmodel qeffort qthinking qprovider qport out_tmp
+  qmodel="$(shell_quote "$model")"
+  qeffort="$(shell_quote "$effort")"
+  qthinking="$(shell_quote "$thinking")"
+  qprovider="$(shell_quote "$provider")"
+  qport="$(shell_quote "$AIRLIFT_REMOTE_PORT")"
+  out_tmp="$(mktemp "${TMPDIR:-/tmp}/airlift-model.XXXXXX")"
+
+  # Runs on the Air against the cockpit's loopback API, so it works whether or
+  # not the Pro tunnel is up. Read-modify-write: preserves every existing
+  # newSessionDefaults field (the API merges only at the top level).
+  ssh "$AIRLIFT_ALIAS" \
+    "AIRLIFT_MODEL=$qmodel AIRLIFT_EFFORT=$qeffort AIRLIFT_THINKING=$qthinking AIRLIFT_PROVIDER=$qprovider AIRLIFT_PORT=$qport AIRLIFT_SET=$set_any bash -s" \
+    <<'REMOTE' >"$out_tmp" 2>&1 || true
+set -eu
+export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$HOME/.codex/bin:$PATH"
+command -v node >/dev/null 2>&1 || { echo "__ERR__ node not found on the Air"; exit 0; }
+node -e '
+const base = `http://127.0.0.1:${process.env.AIRLIFT_PORT}`;
+const provider = process.env.AIRLIFT_PROVIDER || "claude";
+const model = process.env.AIRLIFT_MODEL || "";
+const effort = process.env.AIRLIFT_EFFORT || "";
+const thinking = process.env.AIRLIFT_THINKING || "";
+const doSet = process.env.AIRLIFT_SET === "1";
+const jget = async (p) => { const r = await fetch(base + p); if (!r.ok) throw new Error("HTTP " + r.status); return r.json(); };
+(async () => {
+  let resp;
+  try { resp = await jget("/api/settings"); } catch (e) { console.log("__UNREACHABLE__"); return; }
+  const settings = resp.settings || resp;
+  const cur = settings.newSessionDefaults || {};
+  let models = [];
+  try {
+    const provs = await jget("/api/providers");
+    const arr = Array.isArray(provs) ? provs : (provs.providers || []);
+    const p = arr.find((x) => x.name === provider);
+    models = p ? (p.models || []).map((m) => m.id) : [];
+  } catch (e) {}
+
+  if (!doSet) {
+    const pd = (cur.providers && cur.providers[provider]) || {};
+    console.log("__SHOW__");
+    console.log("  provider: " + (cur.provider || "(unset)"));
+    console.log("  model:    " + (pd.model || cur.model || "(unset, cockpit picks the first available)"));
+    console.log("  effort:   " + (pd.effortLevel || "(unset)"));
+    console.log("  thinking: " + (pd.thinkingMode || "(unset)"));
+    console.log("  available " + provider + " models: " + (models.length ? models.join(", ") : "(none reported)"));
+    return;
+  }
+
+  if (model && models.length && !models.includes(model)) {
+    console.log("__BADMODEL__");
+    console.log("  available " + provider + " models: " + models.join(", "));
+    return;
+  }
+
+  const nsd = JSON.parse(JSON.stringify(cur));
+  nsd.provider = provider;
+  nsd.providers = nsd.providers || {};
+  const pd = { ...(nsd.providers[provider] || {}) };
+  if (model) pd.model = model;
+  if (effort) pd.effortLevel = effort;
+  if (thinking) pd.thinkingMode = thinking;
+  nsd.providers[provider] = pd;
+
+  const put = await fetch(base + "/api/settings", {
+    method: "PUT",
+    headers: { "Content-Type": "application/json", "X-Yep-Anywhere": "true" },
+    body: JSON.stringify({ newSessionDefaults: nsd }),
+  });
+  if (!put.ok) { console.log("__ERR__ HTTP " + put.status + " " + (await put.text()).slice(0, 120)); return; }
+  const saved = await put.json();
+  const savedNsd = (saved.settings || saved).newSessionDefaults || nsd;
+  const sp = (savedNsd.providers || {})[provider] || pd;
+  console.log("__OK__ " + provider + " / " + (sp.model || "(cockpit default)") +
+    (sp.effortLevel ? "  effort=" + sp.effortLevel : "") +
+    (sp.thinkingMode ? "  thinking=" + sp.thinkingMode : ""));
+})().catch((e) => { console.log("__ERR__ " + e.message); });
+'
+REMOTE
+
+  local out
+  out="$(cat "$out_tmp" 2>/dev/null || true)"
+  rm -f "$out_tmp"
+
+  case "$out" in
+    *__UNREACHABLE__*)
+      die "Cockpit is not reachable on the Air. Start it first: airlift open" ;;
+    *__ERR__*)
+      die "Could not update the default model:${out##*__ERR__}" ;;
+    *__BADMODEL__*)
+      warn "That model isn't available for provider '$provider'."
+      printf '%s\n' "$out" | grep -E '^  available'
+      exit 1 ;;
+    *__SHOW__*)
+      say "${BOLD}Default new-session model${RESET}"
+      printf '%s\n' "$out" | grep -vF '__SHOW__'
+      say ""
+      say "${DIM}Change it: airlift model <model> [--effort xhigh] [--thinking off]${RESET}" ;;
+    *__OK__*)
+      ok "New sessions now start with:${out##*__OK__}"
+      say "${DIM}Applies to new cockpit sessions; already-open sessions keep their model.${RESET}" ;;
+    *)
+      die "Unexpected response updating the model:
+$out" ;;
+  esac
+}
+
 main() {
   local command="${1:-help}"
   if [ "$#" -gt 0 ]; then
@@ -868,6 +1427,7 @@ main() {
     setup) setup_cmd "$@" ;;
     open|cockpit|web|codex|claude) cockpit_cmd "$@" ;;
     clone) clone_cmd "$@" ;;
+    model) model_cmd "$@" ;;
     login) login_cmd "$@" ;;
     shell|ssh) shell_cmd "$@" ;;
     awake) awake_cmd "$@" ;;

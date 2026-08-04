@@ -21,11 +21,28 @@ chmod +x "$ROOT"/tests/fakes/*
 
 "$ROOT/airlift" --version | grep -F "airlift "
 "$ROOT/airlift" --help | grep -F "Airlift"
+"$ROOT/airlift" --help | grep -F "airlift model"
 
 # shellcheck disable=SC1091
 source "$ROOT/airlift"
 [ "$(shell_quote "plain")" = "'plain'" ]
 [ "$(shell_quote "it's safe")" = "'it'\\''s safe'" ]
+
+# The tunnel watchdog (auto-reconnect) must bake the control socket, the forward,
+# the alias, and both the health-check and reconnect ssh calls into its script,
+# generated without running the loop.
+(
+  # shellcheck disable=SC2034  # consumed by the sourced write_tunnel_watchdog
+  CONFIG_DIR="$TEMP_HOME/.config/airlift"
+  write_tunnel_watchdog "/tmp/airlift-test.sock" "3400" "3400" "spare-air"
+)
+WATCHDOG="$TEMP_HOME/.config/airlift/tunnel-watchdog.sh"
+[ -f "$WATCHDOG" ]
+grep -F "ssh -fN -M" "$WATCHDOG" >/dev/null
+grep -F "O check" "$WATCHDOG" >/dev/null
+grep -F "/tmp/airlift-test.sock" "$WATCHDOG" >/dev/null
+grep -F "127.0.0.1:" "$WATCHDOG" >/dev/null
+grep -F "spare-air" "$WATCHDOG" >/dev/null
 
 PATH="$ROOT/tests/fakes:$PATH" \
 HOME="$TEMP_HOME" \
@@ -46,6 +63,7 @@ PATH="$ROOT/tests/fakes:$PATH" \
 HOME="$TEMP_HOME" \
 XDG_CONFIG_HOME="$TEMP_HOME/.config" \
 AIRLIFT_TEST_OPEN_LOG="$OPEN_LOG" \
+AIRLIFT_TUNNEL_KEEPALIVE=0 \
 "$ROOT/airlift" open "~/Developer/Dylan's test project" >/dev/null
 
 grep -F "http://127.0.0.1:3400/new-session?projectId=" "$OPEN_LOG" >/dev/null
@@ -61,14 +79,91 @@ PATH="$ROOT/tests/fakes:$PATH" \
 HOME="$TEMP_HOME" \
 XDG_CONFIG_HOME="$TEMP_HOME/.config" \
 AIRLIFT_TEST_OPEN_LOG="$OPEN_LOG" \
+AIRLIFT_TUNNEL_KEEPALIVE=0 \
 "$ROOT/airlift" open >/dev/null
 
 [ "$(wc -l <"$OPEN_LOG" | tr -d ' ')" = "2" ]
+
+# open must not spawn a tunnel watchdog when keep-alive is disabled.
+[ ! -f "$TEMP_HOME/.config/airlift/tunnel-watchdog.pid" ]
 
 PATH="$ROOT/tests/fakes:$PATH" \
 HOME="$TEMP_HOME" \
 XDG_CONFIG_HOME="$TEMP_HOME/.config" \
 "$ROOT/airlift" shutdown >/dev/null
+
+# Doctor must name the account behind each agent, not just report "ready".
+# A mismatch means the cockpit's provider picker would spend someone else's quota.
+
+# The remote scripts prepend ~/.local/bin to PATH, which is where Airlift installs
+# the agents. Stage the fakes there so a real codex/claude cannot shadow them.
+mkdir -p "$TEMP_HOME/.local/bin"
+ln -sf "$ROOT/tests/fakes/codex" "$TEMP_HOME/.local/bin/codex"
+ln -sf "$ROOT/tests/fakes/claude" "$TEMP_HOME/.local/bin/claude"
+
+mkdir -p "$TEMP_HOME/.codex"
+node -e '
+  const fs = require("fs");
+  const claims = {
+    email: "ojas@example.com",
+    "https://api.openai.com/auth": { chatgpt_plan_type: "pro" },
+  };
+  const payload = Buffer.from(JSON.stringify(claims)).toString("base64url");
+  fs.writeFileSync(
+    process.argv[1],
+    JSON.stringify({
+      auth_mode: "chatgpt",
+      tokens: { id_token: ["header", payload, "signature"].join(".") },
+    })
+  );
+' "$TEMP_HOME/.codex/auth.json"
+
+DOCTOR_LOG="$TEMP_HOME/doctor.log"
+PATH="$ROOT/tests/fakes:$PATH" \
+HOME="$TEMP_HOME" \
+XDG_CONFIG_HOME="$TEMP_HOME/.config" \
+"$ROOT/airlift" doctor >"$DOCTOR_LOG" 2>&1
+
+grep -F "ojas@example.com (pro)" "$DOCTOR_LOG" >/dev/null
+grep -F "dylan@example.com (max)" "$DOCTOR_LOG" >/dev/null
+grep -F "DIFFERENT accounts" "$DOCTOR_LOG" >/dev/null
+
+# A dead keep-awake must be loud, not silent.
+grep -F "Keep-awake: NOT ACTIVE" "$DOCTOR_LOG" >/dev/null
+grep -F "sleeps after 1 idle minutes on AC" "$DOCTOR_LOG" >/dev/null
+
+# Low disk headroom must be called out before a clone or build fills the disk.
+grep -F "Only 13Gi free" "$DOCTOR_LOG" >/dev/null
+grep -F "at least 25Gi" "$DOCTOR_LOG" >/dev/null
+
+# doctor must confirm the cockpit is actually serving and the tunnel is live,
+# not just that the binaries are installed.
+grep -F "serving on 127.0.0.1:3400" "$DOCTOR_LOG" >/dev/null
+grep -F "live on 127.0.0.1:3400" "$DOCTOR_LOG" >/dev/null
+
+# clone must refuse when the Air is below the disk-headroom floor (fake df
+# reports 13Gi free vs the 25Gi default), before it ever touches git.
+CLONE_LOG="$TEMP_HOME/clone.log"
+if PATH="$ROOT/tests/fakes:$PATH" \
+  HOME="$TEMP_HOME" \
+  XDG_CONFIG_HOME="$TEMP_HOME/.config" \
+  "$ROOT/airlift" clone "https://example.com/repo.git" >"$CLONE_LOG" 2>&1; then
+  printf 'clone should have refused on low disk\n' >&2
+  exit 1
+fi
+grep -F "Only 13 GiB free" "$CLONE_LOG" >/dev/null
+
+# `airlift model` arg validation is hermetic (fails before any network call).
+if PATH="$ROOT/tests/fakes:$PATH" HOME="$TEMP_HOME" XDG_CONFIG_HOME="$TEMP_HOME/.config" \
+  "$ROOT/airlift" model --effort >/dev/null 2>&1; then
+  printf 'model --effort (no value) should have failed\n' >&2
+  exit 1
+fi
+if PATH="$ROOT/tests/fakes:$PATH" HOME="$TEMP_HOME" XDG_CONFIG_HOME="$TEMP_HOME/.config" \
+  "$ROOT/airlift" model --bogus >/dev/null 2>&1; then
+  printf 'model --bogus should have failed\n' >&2
+  exit 1
+fi
 
 HOME="$TEMP_HOME" "$ROOT/install.sh" >/dev/null
 [ -x "$TEMP_HOME/.local/bin/airlift" ]

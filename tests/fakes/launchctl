@@ -1,0 +1,15 @@
+#!/bin/bash
+
+set -euo pipefail
+
+# Fake launchctl for Airlift smoke tests. Returns predictable exit codes so the
+# launchd keep-awake path is exercised hermetically, without loading a real
+# LaunchAgent on the machine running the tests.
+case "${1:-}" in
+  print) exit 1 ;;     # report "not loaded" so awake proceeds to bootstrap
+  bootout) exit 0 ;;
+  bootstrap) exit 0 ;;
+  kickstart) exit 0 ;;
+  list) exit 1 ;;
+  *) exit 0 ;;
+esac
