@@ -162,7 +162,7 @@ back to a nohup supervisor. `./airlift open` re-asserts keep-awake every time, s
 the daily command is enough to keep the worker awake.
 
 `./airlift doctor` verifies the live `pmset` assertion rather than a PID file, and
-says so loudly when nothing is holding the Air awake — and whether it will survive
+says so loudly when nothing is holding the Air awake, and whether it will survive
 a reboot. The assertion only holds on AC power, so keep the Air plugged in.
 `./airlift sleep` bootouts the agent and removes the plist, so keep-awake stays
 off until you run `awake` again.

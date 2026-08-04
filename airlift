@@ -741,7 +741,7 @@ REMOTE
   ok "Private tunnel is live: MacBook Pro → MacBook Air"
 
   # Keep the tunnel up across Air sleeps / Wi-Fi drops, and make sure the Air is
-  # holding a keep-awake assertion (idempotent — a no-op if already awake).
+  # holding a keep-awake assertion (idempotent: a no-op if already awake).
   start_tunnel_watchdog "$socket" "$local_port" "$remote_port"
   keepawake_ensure quiet
   local url="http://127.0.0.1:$local_port"
@@ -776,7 +776,7 @@ clone_cmd() {
   quoted_destination="$(shell_quote "$destination")"
 
   # Honor the documented disk-headroom floor before a clone can fill the Air.
-  # Capture via temp file (not $(ssh … <<HEREDOC)) for bash 3.2 — see keepawake_ensure.
+  # Capture via temp file (not $(ssh ... <<HEREDOC)) for bash 3.2, see keepawake_ensure.
   local quoted_min_disk free_status disk_tmp
   quoted_min_disk="$(shell_quote "$MIN_DISK_GB")"
   disk_tmp="$(mktemp "${TMPDIR:-/tmp}/airlift-disk.XXXXXX")"
@@ -846,7 +846,7 @@ shell_cmd() {
 keepawake_ensure() {
   # Ensure the Air holds a supervised keep-awake assertion. Prefers a launchd
   # LaunchAgent (survives reboot/logout); falls back to a nohup supervisor.
-  # Idempotent — safe to call on every `open`. Pass "quiet" to suppress chatter.
+  # Idempotent, safe to call on every `open`. Pass "quiet" to suppress chatter.
   local quiet="${1:-}"
   local use_launchd quoted_launchd method tmp
   use_launchd="${AIRLIFT_USE_LAUNCHD:-1}"
@@ -968,7 +968,7 @@ REMOTE
       ;;
     nohup)
       ok "The Air will stay awake while connected to AC power."
-      say "${DIM}Supervised, but not registered with launchd — it won't restart after an Air reboot.${RESET}"
+      say "${DIM}Supervised, but not registered with launchd, so it won't restart after an Air reboot.${RESET}"
       ;;
     *)
       warn "Could not confirm keep-awake started. Check: airlift doctor"
@@ -1179,7 +1179,7 @@ if command -v yepanywhere >/dev/null 2>&1; then
     printf '  Cockpit: yepanywhere %s (serving on 127.0.0.1:%s)\n' \
       "$cockpit_version" "$AIRLIFT_PORT"
   else
-    printf '  Cockpit: yepanywhere %s (installed, not serving — run: airlift open)\n' \
+    printf '  Cockpit: yepanywhere %s (installed, not serving. Run: airlift open)\n' \
       "$cockpit_version"
   fi
 else
@@ -1246,7 +1246,7 @@ if [ "$asserted" -eq 1 ] && [ "$launchd_managed" -eq 1 ]; then
   printf '  Keep-awake: active and supervised by launchd (survives reboot)\n'
 elif [ "$asserted" -eq 1 ] && [ "$supervised" -eq 1 ]; then
   printf '  Keep-awake: active and supervised (restarts if it dies)\n'
-  printf '  ! Not registered with launchd — will NOT restart after an Air reboot. Run: airlift awake\n'
+  printf '  ! Not registered with launchd, will NOT restart after an Air reboot. Run: airlift awake\n'
 elif [ "$asserted" -eq 1 ]; then
   printf '  Keep-awake: active, NOT supervised\n'
   printf '  ! If this assertion dies the Air sleeps and all remote work stops.\n'
@@ -1275,7 +1275,7 @@ REMOTE
     say "Tunnel:   live on 127.0.0.1:$AIRLIFT_LOCAL_PORT (Pro → Air)"
   else
     say ""
-    say "Tunnel:   down — run: airlift open"
+    say "Tunnel:   down. Run: airlift open"
   fi
 
   say ""
@@ -1352,7 +1352,7 @@ const jget = async (p) => { const r = await fetch(base + p); if (!r.ok) throw ne
     const pd = (cur.providers && cur.providers[provider]) || {};
     console.log("__SHOW__");
     console.log("  provider: " + (cur.provider || "(unset)"));
-    console.log("  model:    " + (pd.model || cur.model || "(unset — cockpit picks the first available)"));
+    console.log("  model:    " + (pd.model || cur.model || "(unset, cockpit picks the first available)"));
     console.log("  effort:   " + (pd.effortLevel || "(unset)"));
     console.log("  thinking: " + (pd.thinkingMode || "(unset)"));
     console.log("  available " + provider + " models: " + (models.length ? models.join(", ") : "(none reported)"));
