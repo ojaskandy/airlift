@@ -16,6 +16,7 @@ cleanup() {
   rm -rf "$TEMP_HOME"
 }
 trap cleanup EXIT
+trap 'printf "smoke failed at line %s\n" "$LINENO" >&2' ERR
 
 airlift_test() {
   PATH="$ROOT/tests/fakes:$PATH" \
@@ -25,12 +26,14 @@ airlift_test() {
   AIRLIFT_TEST_OPEN_LOG="$OPEN_LOG" \
   AIRLIFT_TEST_SSH_LOG="$SSH_LOG" \
   AIRLIFT_TEST_METRICS_DIR="$METRICS_DIR" \
+  AIRLIFT_TEST_SELF_UUID="controller-uuid" \
   "$ROOT/airlift" "$@"
 }
 
 bash -n "$ROOT/airlift"
 bash -n "$ROOT/install.sh"
 bash -n "$ROOT/install-worker.sh"
+bash -n "$ROOT/install-controller.sh"
 chmod +x "$ROOT"/tests/fakes/*
 
 WORKER_DRY_RUN="$("$ROOT/install-worker.sh" --dry-run)"
@@ -45,7 +48,7 @@ printf '%s\n' "$WORKER_ONE_COMMAND_DRY_RUN" | grep -F "systemsetup -setremotelog
 WORKER_WRAPPER_DRY_RUN="$("$ROOT/install.sh" --worker --dry-run)"
 printf '%s\n' "$WORKER_WRAPPER_DRY_RUN" | grep -F "systemsetup -setremotelogin on" >/dev/null
 
-"$ROOT/airlift" --version | grep -F "airlift 0.3.0"
+"$ROOT/airlift" --version | grep -F "airlift 0.4.0"
 "$ROOT/airlift" --help | grep -F "Airlift"
 
 # shellcheck disable=SC1091
@@ -54,7 +57,7 @@ source "$ROOT/airlift"
 [ "$(shell_quote "it's safe")" = "'it'\\''s safe'" ]
 [ "$(awk -v busy=2 -v slots=4 -v load_value=1 -v cores=8 'BEGIN { printf "%.1f", (busy / slots) * 1000 + (load_value / cores) * 100 }')" = "512.5" ]
 
-mkdir -p "$METRICS_DIR"
+mkdir -p "$METRICS_DIR" "$TEMP_HOME/.local/bin"
 airlift_test setup worker@air.local --install none --no-awake >/dev/null 2>&1
 ln -sf "$ROOT/tests/fakes/codex" "$TEMP_HOME/.local/bin/codex"
 ln -sf "$ROOT/tests/fakes/claude" "$TEMP_HOME/.local/bin/claude"
@@ -66,6 +69,7 @@ grep -F "ForwardAgent no" "$TEMP_HOME/.ssh/config" >/dev/null
 grep -F "AIRLIFT_CONFIG_VERSION='3'" "$TEMP_HOME/.config/airlift/config" >/dev/null
 grep -F "AIRLIFT_DEFAULT_NODE='spare-air'" "$TEMP_HOME/.config/airlift/config" >/dev/null
 grep -F "AIRLIFT_ALIAS='spare-air'" "$TEMP_HOME/.config/airlift/nodes/spare-air" >/dev/null
+grep -F "AIRLIFT_HARDWARE_UUID='uuid-spare-air'" "$TEMP_HOME/.config/airlift/nodes/spare-air" >/dev/null
 grep -F "AIRLIFT_SLOTS='auto'" "$TEMP_HOME/.config/airlift/nodes/spare-air" >/dev/null
 grep -F "Added by Airlift" "$TEMP_HOME/.zprofile" >/dev/null
 
@@ -102,11 +106,16 @@ printf '%s\n' "$RUN_OUTPUT" | grep -F "codex[$TEMP_HOME/Developer/Dylan's test p
 CLAUDE_OUTPUT="$(airlift_test run --agent claude --worker spare-air --project "~/Developer/Dylan's test project" "review this")"
 printf '%s\n' "$CLAUDE_OUTPUT" | grep -F "claude[$TEMP_HOME/Developer/Dylan's test project]: review this" >/dev/null
 
-# An otherwise attractive worker is excluded when it does not have the checkout.
+# Missing checkout is no longer fatal for run/exec: least-used worker still wins.
 printf '0\t8\t0.2\t24\t0\t0\tBeefy Mac\n' >"$METRICS_DIR/beefy"
 : >"$SSH_LOG"
-airlift_test run --project "~/Developer/Dylan's test project" "route around missing checkout" >/dev/null
-grep -F "spare-air AIRLIFT_AGENT=" "$SSH_LOG" >/dev/null
+airlift_test run --project "~/Developer/Dylan's test project" "route onto empty worker" >/dev/null
+grep -F "beefy AIRLIFT_AGENT=" "$SSH_LOG" >/dev/null
+
+# Offline pool falls back to the local binary.
+rm -f "$METRICS_DIR/spare-air" "$METRICS_DIR/beefy"
+LOCAL_FALLBACK="$(airlift_test run --project "~/Developer/Dylan's test project" "stay local")"
+printf '%s\n' "$LOCAL_FALLBACK" | grep -F "codex[$TEMP_HOME/Developer/Dylan's test project]: stay local" >/dev/null
 
 airlift_test stop >/dev/null
 airlift_test shutdown --worker beefy >/dev/null
@@ -128,5 +137,8 @@ grep -F "AIRLIFT_TARGET='worker@old.local'" "$LEGACY_HOME/.config/airlift/nodes/
 
 HOME="$TEMP_HOME" "$ROOT/install.sh" >/dev/null
 [ -x "$TEMP_HOME/.local/bin/airlift" ]
+[ -x "$TEMP_HOME/.local/bin/claude" ]
+[ -x "$TEMP_HOME/.local/bin/codex" ]
+grep -F "exec --agent claude" "$TEMP_HOME/.local/bin/claude" >/dev/null
 
 printf 'smoke tests passed\n'

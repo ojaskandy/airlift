@@ -2,7 +2,7 @@
 
 set -euo pipefail
 
-RAW_BASE_URL="https://raw.githubusercontent.com/ojaskandy/airlift/main"
+RAW_BASE_URL="${AIRLIFT_RAW_BASE_URL:-https://raw.githubusercontent.com/ojaskandy/airlift/v0.4}"
 SOURCE_PATH="${BASH_SOURCE[0]:-}"
 ROOT=""
 
@@ -77,3 +77,46 @@ fi
 
 printf 'Installed Airlift at %s\n' "$TARGET"
 printf 'Restart Terminal or run: export PATH="$HOME/.local/bin:$PATH"\n'
+
+install_shim() {
+  local agent="$1"
+  local shim="$BIN_DIR/$agent"
+  rm -f "$shim"
+  cat >"$shim" <<EOF
+#!/bin/bash
+set -euo pipefail
+AIRLIFT_BIN="\$HOME/.local/bin/airlift"
+CONFIG="\${XDG_CONFIG_HOME:-\$HOME/.config}/airlift/real-binaries"
+real=""
+if [ -f "\$CONFIG" ]; then
+  # shellcheck disable=SC1090
+  source "\$CONFIG"
+  case "$agent" in
+    claude) real="\${AIRLIFT_REAL_CLAUDE:-}" ;;
+    codex) real="\${AIRLIFT_REAL_CODEX:-}" ;;
+  esac
+fi
+if [ -n "\${AIRLIFT_IN_EXEC:-}" ]; then
+  [ -n "\$real" ] && [ -x "\$real" ] || { printf 'Error: no real %s binary recorded.\\n' "$agent" >&2; exit 1; }
+  exec "\$real" "\$@"
+fi
+exec "\$AIRLIFT_BIN" exec --agent $agent --cwd "\$PWD" -- "\$@"
+EOF
+  chmod +x "$shim"
+}
+
+# Record real binaries before shims hide them.
+mkdir -p "${XDG_CONFIG_HOME:-$HOME/.config}/airlift"
+REAL_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/airlift/real-binaries"
+claude_real="$(command -v claude 2>/dev/null || true)"
+codex_real="$(command -v codex 2>/dev/null || true)"
+case "${claude_real}" in *airlift*|"$BIN_DIR/claude") claude_real="" ;; esac
+case "${codex_real}" in *airlift*|"$BIN_DIR/codex") codex_real="" ;; esac
+{
+  printf "AIRLIFT_REAL_CLAUDE='%s'\n" "$claude_real"
+  printf "AIRLIFT_REAL_CODEX='%s'\n" "$codex_real"
+} >"$REAL_FILE"
+chmod 600 "$REAL_FILE"
+install_shim claude
+install_shim codex
+printf 'Installed claude/codex shims at %s (they hop via Airlift)\n' "$BIN_DIR"

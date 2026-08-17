@@ -14,70 +14,80 @@ real [Codex CLI](https://github.com/openai/codex),
 [Yep Anywhere](https://github.com/kzahel/yepanywhere). It does not proxy prompts
 through a new AI provider.
 
-## Send this to Dylan
+## Install v0.4 (this hop release)
 
-On every Mac that will do work, open Terminal and run exactly one command:
+Clone the `v0.4` branch. Do not clone `main`; that is the older one-worker
+cockpit.
 
-```bash
-/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/ojaskandy/airlift/main/install-worker.sh)"
-```
-
-The command downloads the public worker installer over HTTPS and runs it as the
-current user. The installer:
-
-- installs the `airlift` command under `~/.local/bin`;
-- asks for administrator approval when macOS enables Remote Login;
-- preserves the existing Remote Login access list and allows the current user;
-- verifies that Remote Login is on; and
-- prints that worker's exact `airlift join` command for the controller Mac.
-
-macOS always shows an administrator prompt before a script can change Remote
-Login. The whole script is readable at
-[`install-worker.sh`](https://github.com/ojaskandy/airlift/blob/main/install-worker.sh).
-To preview its actions without changing the Mac, use the same one-command flow
-with `--dry-run`:
+**Controller** (the laptop that should stay light — Dylan's Mac):
 
 ```bash
-/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/ojaskandy/airlift/main/install-worker.sh)" -- --dry-run
+git clone --branch v0.4 https://github.com/ojaskandy/airlift.git ~/airlift
+cd ~/airlift
+./install.sh
+export PATH="$HOME/.local/bin:$PATH"
 ```
 
-Then run this on Dylan's MacBook Pro:
+That installs `airlift` plus `claude` / `codex` shims. After the pool is joined,
+those two commands hop to a spare Mac by themselves. If every worker is asleep,
+they run locally and say so.
+
+**Workers** (spare Macs that will take the load). Run this on each one, not
+`./install.sh`:
 
 ```bash
-git clone https://github.com/ojaskandy/airlift.git
-cd airlift
-
-# Ojas's spare Air
-./airlift setup <air-username>@Dylans-MacBook-Air.local
-
-# Add more workers whenever they become available
-./airlift join <username>@Beefy-Mac.local --alias beefy --slots 6
-
-./airlift nodes
-./airlift open '~/Developer/your-project'
+git clone --branch v0.4 https://github.com/ojaskandy/airlift.git ~/airlift
+cd ~/airlift
+./install-worker.sh
 ```
 
-Replace each username and hostname with the values shown on that worker Mac.
+The worker installer asks macOS to enable Remote Login, then prints a join
+command. Run each printed command on the controller, then check the pool:
+
+```bash
+airlift join <user>@Spare-Air.local --alias spare
+airlift nodes
+```
+
+One-command worker install (same `v0.4` tree):
+
+```bash
+/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/ojaskandy/airlift/v0.4/install-worker.sh)"
+```
+
+Preview without changing the Mac:
+
+```bash
+/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/ojaskandy/airlift/v0.4/install-worker.sh)" -- --dry-run
+```
+
 `setup` is the compatible one-worker path from Airlift v0.2; `join` adds more
-workers to the same local pool.
+workers to the same local pool. Cursor's in-editor Agent still runs on the
+controller. `./install.sh` belongs on the controller only; workers that also
+install those shims can hop into themselves.
 
-The initial worker bootstrap must run locally once: a controller cannot connect
-over SSH until Remote Login is enabled. Airlift uses Apple's supported
+The worker bootstrap must run locally once: a controller cannot connect over
+SSH until Remote Login is enabled. Airlift uses Apple's supported
 [`systemsetup -setremotelogin on`](https://support.apple.com/guide/remote-desktop/about-systemsetup-apd95406b8d/mac)
 command and preserves the worker's existing allowed-users policy, adding only
-the user running the installer when necessary. You can review that policy later
-under **System Settings → General → Sharing → Remote Login**.
+the user running the installer when necessary. Review that later under
+**System Settings → General → Sharing → Remote Login**.
 
 ## Route a task
 
-Put the checkout at the same logical path on every eligible worker:
+`claude` and `codex` on the controller copy the current git worktree to the
+chosen Mac, run there, and copy edits back. You do not have to pre-clone the
+repo onto every worker for that hop.
+
+`airlift run` is the explicit one-shot path. To pin a shared checkout on every
+worker instead of copying per job:
 
 ```bash
 ./airlift clone git@github.com:your-org/your-repo.git --worker all
 ```
 
 Then send a task. Airlift probes the pool in parallel, chooses the least-used
-Mac that has the checkout, and streams the agent's output back over SSH:
+Mac, and streams the agent's output back over SSH:
 
 ```bash
 ./airlift run \
@@ -214,16 +224,16 @@ exit
 
 ```bash
 ./airlift nodes                                  # Live load across the pool
-./airlift run --project PATH 'task'              # Auto-route a Codex task
+claude -p 'Fix the failing unit test'            # Hops off this Mac when a worker is free
+codex exec -C ~/Developer/your-repo -            # Same
+./airlift run --project PATH 'task'              # Explicit one-shot hop (Codex)
 ./airlift run --agent claude --project PATH 'task'
+./airlift local on|off                           # Force this Mac / resume hopping
 ./airlift open PATH                              # Auto-route a new cockpit
-./airlift open PATH --worker beefy               # Pin a cockpit
 ./airlift clone GIT_URL --worker all             # Prepare every worker
 ./airlift doctor --worker beefy                   # Check one worker
-./airlift login codex --worker beefy              # Redo provider auth
 ./airlift shell beefy                             # Normal worker shell
 ./airlift stop                                    # Close the active tunnel
-./airlift shutdown --worker beefy                 # Stop that cockpit server
 ```
 
 Optional global installation:
@@ -236,7 +246,7 @@ airlift nodes
 Without cloning the repository first:
 
 ```bash
-/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/ojaskandy/airlift/main/install.sh)"
+/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/ojaskandy/airlift/v0.4/install.sh)"
 ```
 
 ## What `setup` and `join` install
@@ -284,8 +294,8 @@ Common failures:
 - **Offline:** wake the Mac and enable Remote Login.
 - **Tailscale worker is offline:** confirm both devices are connected and run
   `tailscale ping WORKER_NAME` when the CLI is available.
-- **Project missing:** use the same path on that worker or run `clone --worker
-  all`.
+- **Project missing:** `claude` / `codex` hop copies the worktree. For `airlift
+  run` against a shared checkout, use the same path or `clone --worker all`.
 - **Sign-in required:** run `login codex` or `login claude` for that worker.
 - **Private clone fails:** authenticate GitHub separately on that worker.
 - **Local port 3400 is busy:** run `open --local-port 3401`.

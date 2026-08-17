@@ -7,6 +7,18 @@ if [ -n "${AIRLIFT_TEST_SSH_LOG:-}" ]; then
 fi
 
 last="${!#}"
+if [ "$last" = "airlift-uuid" ]; then
+  host="unknown"
+  prev=""
+  for arg in "$@"; do
+    if [ "$arg" = "airlift-uuid" ]; then
+      host="$prev"
+    fi
+    prev="$arg"
+  done
+  printf 'uuid-%s\n' "$host"
+  exit 0
+fi
 if [[ "$last" == *"AIRLIFT_METRICS=1"* ]] && [ -n "${AIRLIFT_TEST_METRICS_DIR:-}" ]; then
   for arg in "$@"; do
     if [ -f "$AIRLIFT_TEST_METRICS_DIR/$arg" ]; then

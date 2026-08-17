@@ -2,7 +2,7 @@
 
 set -euo pipefail
 
-RAW_BASE_URL="${AIRLIFT_RAW_BASE_URL:-https://raw.githubusercontent.com/ojaskandy/airlift/main}"
+RAW_BASE_URL="${AIRLIFT_RAW_BASE_URL:-https://raw.githubusercontent.com/ojaskandy/airlift/v0.4}"
 BIN_DIR="$HOME/.local/bin"
 TARGET="$BIN_DIR/airlift"
 PROFILE="$HOME/.zprofile"
