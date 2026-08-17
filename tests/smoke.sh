@@ -9,6 +9,11 @@ OPEN_LOG="$TEMP_HOME/open.log"
 SSH_LOG="$TEMP_HOME/ssh.log"
 
 cleanup() {
+  if [ -n "${DASH_PID:-}" ]; then
+    kill "$DASH_PID" >/dev/null 2>&1 || true
+    wait "$DASH_PID" >/dev/null 2>&1 || true
+  fi
+  pkill -f "airlift-dash" >/dev/null 2>&1 || true
   if [ -f "$TEMP_HOME/.airlift/yep-3400.pid" ]; then
     pid="$(cat "$TEMP_HOME/.airlift/yep-3400.pid" 2>/dev/null || true)"
     if [ -n "$pid" ]; then kill "$pid" >/dev/null 2>&1 || true; fi
@@ -48,8 +53,10 @@ printf '%s\n' "$WORKER_ONE_COMMAND_DRY_RUN" | grep -F "systemsetup -setremotelog
 WORKER_WRAPPER_DRY_RUN="$("$ROOT/install.sh" --worker --dry-run)"
 printf '%s\n' "$WORKER_WRAPPER_DRY_RUN" | grep -F "systemsetup -setremotelogin on" >/dev/null
 
-"$ROOT/airlift" --version | grep -F "airlift 0.4.0"
+"$ROOT/airlift" --version | grep -F "airlift 0.4.1"
 "$ROOT/airlift" --help | grep -F "Airlift"
+"$ROOT/airlift" --help | grep -F "dashboard"
+[ -f "$ROOT/dashboard.html" ]
 
 # shellcheck disable=SC1091
 source "$ROOT/airlift"
@@ -79,14 +86,51 @@ grep -F "AIRLIFT_SLOTS='8'" "$TEMP_HOME/.config/airlift/nodes/beefy" >/dev/null
 grep -F "AIRLIFT_TRANSPORT='tailscale'" "$TEMP_HOME/.config/airlift/nodes/beefy" >/dev/null
 
 mkdir -p "$TEMP_HOME/Developer/Dylan's test project"
-printf '2\t2\t0.4\t8\t1\t2\tSpare Air\n' >"$METRICS_DIR/spare-air"
-printf '0\t8\t0.2\t24\t1\t0\tBeefy Mac\n' >"$METRICS_DIR/beefy"
+printf '2\t2\t0.4\t8\t1\t2\tSpare Air\t8589934592\t17179869184\tclaude|1001|512000|claude -p fix\n' >"$METRICS_DIR/spare-air"
+printf '0\t8\t0.2\t24\t1\t0\tBeefy Mac\t4294967296\t34359738368\t\n' >"$METRICS_DIR/beefy"
 
 POOL_OUTPUT="$(airlift_test nodes)"
 printf '%s\n' "$POOL_OUTPUT" | grep -F "spare-air" >/dev/null
 printf '%s\n' "$POOL_OUTPUT" | grep -F "beefy" >/dev/null
 printf '%s\n' "$POOL_OUTPUT" | grep -F "0/8" >/dev/null
 printf '%s\n' "$POOL_OUTPUT" | grep -F "tailscale" >/dev/null
+printf '%s\n' "$POOL_OUTPUT" | grep -F "8.0/16G" >/dev/null
+
+POOL_JSON="$(airlift_test nodes --json)"
+printf '%s\n' "$POOL_JSON" | python3 -c '
+import json, sys
+data = json.load(sys.stdin)
+ids = {machine["alias"] for machine in data["machines"]}
+assert "this-mac" in ids
+assert "spare-air" in ids
+assert "beefy" in ids
+spare = next(machine for machine in data["machines"] if machine["alias"] == "spare-air")
+assert spare["mem_total"] == 17179869184
+assert spare["tasks"][0]["agent"] == "claude"
+assert data["version"] == "0.4.1"
+'
+
+DASH_PORT="$((34000 + ($$ % 1000)))"
+airlift_test dashboard --port "$DASH_PORT" --no-open >/dev/null 2>&1 &
+DASH_PID="$!"
+ready="0"
+for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+  if curl -fsS "http://127.0.0.1:$DASH_PORT/" >/dev/null 2>&1; then
+    ready="1"
+    break
+  fi
+  sleep 0.2
+done
+[ "$ready" = "1" ]
+curl -fsS "http://127.0.0.1:$DASH_PORT/" | grep -F "House pool" >/dev/null
+curl -fsS "http://127.0.0.1:$DASH_PORT/api/pool" | python3 -c '
+import json, sys
+data = json.load(sys.stdin)
+assert any(machine["alias"] == "this-mac" for machine in data["machines"])
+'
+kill "$DASH_PID" >/dev/null 2>&1 || true
+wait "$DASH_PID" >/dev/null 2>&1 || true
+DASH_PID=""
 
 : >"$SSH_LOG"
 airlift_test clone git@github.com:example/project.git '~/Developer/cloned' --worker all >/dev/null
@@ -139,6 +183,7 @@ HOME="$TEMP_HOME" "$ROOT/install.sh" >/dev/null
 [ -x "$TEMP_HOME/.local/bin/airlift" ]
 [ -x "$TEMP_HOME/.local/bin/claude" ]
 [ -x "$TEMP_HOME/.local/bin/codex" ]
+[ -f "$TEMP_HOME/.local/share/airlift/dashboard.html" ]
 grep -F "exec --agent claude" "$TEMP_HOME/.local/bin/claude" >/dev/null
 
 printf 'smoke tests passed\n'

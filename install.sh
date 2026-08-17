@@ -78,6 +78,22 @@ fi
 printf 'Installed Airlift at %s\n' "$TARGET"
 printf 'Restart Terminal or run: export PATH="$HOME/.local/bin:$PATH"\n'
 
+SHARE_DIR="$HOME/.local/share/airlift"
+mkdir -p "$SHARE_DIR"
+if [ -n "$ROOT" ] && [ -f "$ROOT/dashboard.html" ]; then
+  cp "$ROOT/dashboard.html" "$SHARE_DIR/dashboard.html"
+else
+  command -v curl >/dev/null 2>&1 || {
+    printf 'Error: curl is required to download the Airlift dashboard.\n' >&2
+    exit 1
+  }
+  if ! curl -fsSL "$RAW_BASE_URL/dashboard.html" -o "$SHARE_DIR/dashboard.html"; then
+    printf 'Error: could not download the Airlift dashboard from GitHub.\n' >&2
+    exit 1
+  fi
+fi
+printf 'Pool board: airlift dashboard\n'
+
 install_shim() {
   local agent="$1"
   local shim="$BIN_DIR/$agent"

@@ -47,7 +47,12 @@ command. Run each printed command on the controller, then check the pool:
 ```bash
 airlift join <user>@Spare-Air.local --alias spare
 airlift nodes
+airlift dashboard
 ```
+
+`airlift dashboard` opens a localhost board of every Mac in the pool: online
+state, load, RAM, running `claude`/`codex` tasks, and a feed of where hops went.
+It does not leave this computer. Ctrl-C in that terminal stops it.
 
 One-command worker install (same `v0.4` tree):
 
@@ -224,6 +229,7 @@ exit
 
 ```bash
 ./airlift nodes                                  # Live load across the pool
+./airlift dashboard                              # Localhost board: RAM, load, tasks
 claude -p 'Fix the failing unit test'            # Hops off this Mac when a worker is free
 codex exec -C ~/Developer/your-repo -            # Same
 ./airlift run --project PATH 'task'              # Explicit one-shot hop (Codex)
