@@ -1,0 +1,338 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Airlift pool</title>
+  <style>
+    :root {
+      --bg: #0b0c09;
+      --bg-card: #14150f;
+      --line: #2a2c22;
+      --ink: #e8e4d4;
+      --muted: #8b8774;
+      --lime: #d6ff3f;
+      --amber: #ffb020;
+      --red: #ff5a3c;
+      --you: #7dd3c0;
+      --blue: #6bb6ff;
+      --violet: #b48cff;
+    }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; min-height: 100%; background: var(--bg); color: var(--ink); }
+    body {
+      font-family: "SF Mono", ui-monospace, Menlo, Consolas, monospace;
+      font-size: 13px;
+      letter-spacing: 0.01em;
+    }
+    header {
+      display: flex;
+      align-items: flex-end;
+      justify-content: space-between;
+      gap: 24px;
+      padding: 28px 32px 20px;
+      border-bottom: 1px solid var(--line);
+    }
+    .wordmark {
+      font-family: "Iowan Old Style", Palatino, "Palatino Linotype", Georgia, serif;
+      font-size: 42px;
+      font-weight: 700;
+      line-height: 0.9;
+      letter-spacing: -0.03em;
+    }
+    .wordmark span { color: var(--lime); }
+    .sub { color: var(--muted); margin-top: 8px; font-size: 11px; text-transform: uppercase; letter-spacing: 0.16em; }
+    .stats { display: flex; gap: 22px; text-align: right; flex-wrap: wrap; justify-content: flex-end; }
+    .stat b { display: block; font-size: 22px; font-weight: 600; color: var(--lime); }
+    .stat b.hot { color: var(--red); }
+    .stat span { color: var(--muted); font-size: 10px; text-transform: uppercase; letter-spacing: 0.14em; }
+    main { display: grid; grid-template-columns: 1.6fr 0.9fr; gap: 0; min-height: calc(100vh - 110px); }
+    @media (max-width: 960px) { main { grid-template-columns: 1fr; } }
+    .board { padding: 24px 32px 48px; }
+    .feed {
+      border-left: 1px solid var(--line);
+      padding: 24px 28px 48px;
+      background: #0e0f0b;
+    }
+    @media (max-width: 960px) { .feed { border-left: 0; border-top: 1px solid var(--line); } }
+    h2 {
+      margin: 0 0 16px;
+      font-size: 10px;
+      font-weight: 600;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.18em;
+    }
+    .grid { display: grid; gap: 14px; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); }
+    .card {
+      background: var(--bg-card);
+      border: 1px solid var(--line);
+      padding: 16px 16px 14px;
+    }
+    .card.you { border-color: #2f5f56; }
+    .card.offline { opacity: 0.62; }
+    .top { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; }
+    .name { font-size: 16px; font-weight: 600; }
+    .alias { color: var(--muted); font-size: 11px; }
+    .pip {
+      font-size: 10px;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+      color: var(--lime);
+    }
+    .pip.off { color: var(--red); }
+    .pip.you { color: var(--you); }
+    .meta { color: var(--muted); font-size: 11px; margin: 6px 0 14px; }
+    .row { display: grid; grid-template-columns: 48px 1fr 88px; gap: 8px; align-items: center; margin: 6px 0; }
+    .row label { color: var(--muted); font-size: 10px; letter-spacing: 0.12em; }
+    .bar { height: 7px; background: #24261c; overflow: hidden; }
+    .bar > i { display: block; height: 100%; background: var(--lime); width: 0; }
+    .bar.load > i { background: var(--amber); }
+    .bar.temp > i { background: var(--red); }
+    .bar.gpu > i { background: var(--blue); }
+    .bar.disk > i { background: var(--violet); }
+    .bar.hot > i { background: var(--red); }
+    .row b { font-weight: 500; text-align: right; font-size: 11px; }
+    .detail { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; margin-top: 10px; color: var(--muted); font-size: 10px; }
+    .detail span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .detail b { color: var(--ink); font-weight: 500; }
+    .slots { display: flex; gap: 4px; margin: 10px 0 8px; }
+    .slot { width: 10px; height: 10px; border: 1px solid #4a4e38; }
+    .slot.on { background: var(--lime); border-color: var(--lime); }
+    .tasks { margin-top: 10px; border-top: 1px solid var(--line); padding-top: 8px; min-height: 28px; }
+    .task { display: flex; justify-content: space-between; gap: 10px; padding: 4px 0; color: var(--ink); }
+    .task em { font-style: normal; color: var(--lime); text-transform: uppercase; font-size: 10px; letter-spacing: 0.1em; }
+    .task span { color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .empty { color: var(--muted); }
+    .feed-block + .feed-block { margin-top: 28px; padding-top: 24px; border-top: 1px solid var(--line); }
+    .event { padding: 8px 0; border-bottom: 1px solid var(--line); }
+    .event time { display: block; color: var(--muted); font-size: 10px; letter-spacing: 0.08em; }
+    .help { margin: 0 0 12px; color: var(--muted); font-size: 12px; line-height: 1.45; }
+    .cmd-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-top: 14px; }
+    .cmd-head strong { color: var(--ink); font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.12em; }
+    .copy {
+      border: 1px solid var(--line);
+      background: #171810;
+      color: var(--lime);
+      font: inherit;
+      font-size: 10px;
+      line-height: 1;
+      padding: 7px 9px;
+      cursor: pointer;
+    }
+    .copy.ok { border-color: #2f5f56; color: var(--you); }
+    pre {
+      margin: 8px 0 0;
+      padding: 10px;
+      max-width: 100%;
+      overflow: auto;
+      background: #090a07;
+      border: 1px solid var(--line);
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+    code { font: inherit; color: #dcd8c8; }
+    .fail { color: var(--red); padding: 12px 32px 0; }
+    footer { color: var(--muted); font-size: 10px; letter-spacing: 0.12em; text-transform: uppercase; margin-top: 18px; }
+  </style>
+</head>
+<body>
+  <header>
+    <div>
+      <div class="wordmark">Air<span>lift</span></div>
+      <div class="sub">House pool · localhost only</div>
+    </div>
+    <div class="stats">
+      <div class="stat"><b id="stat-macs">0</b><span>Macs</span></div>
+      <div class="stat"><b id="stat-live">0</b><span>Awake</span></div>
+      <div class="stat"><b id="stat-tasks">0</b><span>Tasks</span></div>
+      <div class="stat"><b id="stat-hot">0</b><span>Hot</span></div>
+      <div class="stat"><b id="stat-ram">—</b><span>RAM in use</span></div>
+    </div>
+  </header>
+  <p id="fail" class="fail" hidden></p>
+  <main>
+    <section class="board">
+      <h2>Machines</h2>
+      <div class="grid" id="grid"></div>
+      <footer id="stamp">Waiting for pool…</footer>
+    </section>
+    <aside class="feed">
+      <section class="feed-block">
+        <h2>Where work went</h2>
+        <div id="events"></div>
+      </section>
+      <section class="feed-block">
+        <h2>Add a Mac</h2>
+        <p class="help">Run worker setup on the new Mac. Paste its printed join command on the controller, then refresh this board.</p>
+        <div class="cmd-head">
+          <strong>New worker</strong>
+          <button class="copy" type="button" data-target="cmd-worker">Copy</button>
+        </div>
+        <pre><code id="cmd-worker">git clone --branch codex/multi-mac-pool https://github.com/ojaskandy/airlift.git ~/airlift
+cd ~/airlift
+./install-worker.sh</code></pre>
+        <div class="cmd-head">
+          <strong>Controller check</strong>
+          <button class="copy" type="button" data-target="cmd-controller">Copy</button>
+        </div>
+        <pre><code id="cmd-controller">airlift nodes
+airlift dashboard</code></pre>
+        <p class="help">Use a Tailscale MagicDNS name with <code>--transport tailscale</code> when Macs are not on the same Wi-Fi.</p>
+      </section>
+    </aside>
+  </main>
+  <script>
+    const $ = (id) => document.getElementById(id);
+    const fmtGiB = (n) => {
+      const g = Number(n) / 1073741824;
+      if (!Number.isFinite(g) || g <= 0) return "—";
+      return g >= 10 ? g.toFixed(0) + "G" : g.toFixed(1) + "G";
+    };
+    const fmtRss = (kb) => {
+      const g = Number(kb) / 1048576;
+      if (!Number.isFinite(g) || g <= 0) return "";
+      return g >= 1 ? g.toFixed(1) + "G" : (Number(kb) / 1024).toFixed(0) + "M";
+    };
+    const fmtTemp = (n) => {
+      if (n === null || n === undefined || n === "") return "—";
+      const v = Number(n);
+      return Number.isFinite(v) && v > 0 ? v.toFixed(0) + "C" : "—";
+    };
+    const fmtPct = (n) => {
+      if (n === null || n === undefined || n === "") return "—";
+      const v = Number(n);
+      return Number.isFinite(v) ? v.toFixed(0) + "%" : "—";
+    };
+    const fmtWatts = (mw) => {
+      if (mw === null || mw === undefined || mw === "") return "—";
+      const w = Number(mw) / 1000;
+      return Number.isFinite(w) ? w.toFixed(w >= 10 ? 0 : 1) + "W" : "—";
+    };
+    const tempPct = (n) => {
+      const v = Number(n);
+      if (!Number.isFinite(v) || v <= 0) return 0;
+      return Math.max(0, Math.min(100, ((v - 35) / 65) * 100));
+    };
+    const isHot = (m) => {
+      const temp = Number(m.cpu_temp_c || 0);
+      const pressure = String(m.thermal_pressure || "").toLowerCase();
+      return temp >= 80 || (!!pressure && !/(nominal|normal|ok)/.test(pressure));
+    };
+    const pct = (used, total) => {
+      if (!total) return 0;
+      return Math.max(0, Math.min(100, (used / total) * 100));
+    };
+    const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({
+      "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
+    }[c]));
+    async function copyText(text) {
+      if (navigator.clipboard && window.isSecureContext) {
+        try {
+          await navigator.clipboard.writeText(text);
+          return;
+        } catch (_) {
+          // Fall through to the textarea path when clipboard permission is blocked.
+        }
+      }
+      const ta = document.createElement("textarea");
+      ta.value = text;
+      ta.style.position = "fixed";
+      ta.style.left = "-9999px";
+      document.body.appendChild(ta);
+      ta.focus();
+      ta.select();
+      document.execCommand("copy");
+      ta.remove();
+    }
+    document.querySelectorAll(".copy[data-target]").forEach((button) => {
+      button.addEventListener("click", async () => {
+        const target = $(button.dataset.target);
+        if (!target) return;
+        await copyText(target.textContent.trim());
+        const original = button.textContent;
+        button.textContent = "Copied";
+        button.classList.add("ok");
+        setTimeout(() => {
+          button.textContent = original;
+          button.classList.remove("ok");
+        }, 1200);
+      });
+    });
+
+    function render(data) {
+      const machines = data.machines || [];
+      const awake = machines.filter((m) => m.status !== "offline");
+      const tasks = machines.flatMap((m) => m.tasks || []);
+      const ramUsed = machines.reduce((n, m) => n + Number(m.mem_used || 0), 0);
+      const ramTotal = machines.reduce((n, m) => n + Number(m.mem_total || 0), 0);
+      const hot = awake.filter(isHot);
+      $("stat-macs").textContent = String(machines.length);
+      $("stat-live").textContent = String(awake.length);
+      $("stat-tasks").textContent = String(tasks.length);
+      $("stat-hot").textContent = String(hot.length);
+      $("stat-hot").className = hot.length ? "hot" : "";
+      $("stat-ram").textContent = ramTotal ? fmtGiB(ramUsed) + "/" + fmtGiB(ramTotal) : "—";
+      $("grid").innerHTML = machines.map((m) => {
+        const loadPct = m.cores ? Math.min(100, (Number(m.load || 0) / Number(m.cores)) * 100) : 0;
+        const ramPct = pct(m.mem_used, m.mem_total);
+        const gpuPct = Number(m.gpu_active_pct || 0);
+        const diskPct = pct(m.disk_used, m.disk_total);
+        const slots = Math.max(1, Number(m.slots || 1));
+        const busy = Math.max(0, Number(m.busy || 0));
+        const role = m.role === "controller" ? "you" : (m.status === "offline" ? "off" : "");
+        const pip = m.role === "controller" ? "this mac" : m.status;
+        const slotHtml = Array.from({ length: slots }, (_, i) =>
+          `<i class="slot${i < busy ? " on" : ""}"></i>`
+        ).join("");
+        const taskHtml = (m.tasks && m.tasks.length)
+          ? m.tasks.map((t) =>
+              `<div class="task"><em>${esc(t.agent)}</em><span>${esc(t.command || ("pid " + t.pid))}</span><b>${esc(fmtRss(t.rss_kb))}</b></div>`
+            ).join("")
+          : `<div class="empty">${m.status === "offline" ? "unreachable" : "idle"}</div>`;
+        return `<article class="card ${m.role === "controller" ? "you" : ""} ${m.status === "offline" ? "offline" : ""}">
+          <div class="top">
+            <div>
+              <div class="name">${esc(m.name || m.alias)}</div>
+              <div class="alias">${esc(m.alias)}${m.target ? " · " + esc(m.target) : ""}</div>
+            </div>
+            <div class="pip ${role}">${esc(pip)}</div>
+          </div>
+          <div class="meta">${esc(m.transport || "local")} · ${esc(String(m.cores || "—"))} cores · use ${esc(String(busy))}/${esc(String(slots))}${m.gpu_name ? " · " + esc(m.gpu_name) : ""}</div>
+          <div class="row"><label>LOAD</label><div class="bar load ${loadPct > 85 ? "hot" : ""}"><i style="width:${loadPct}%"></i></div><b>${esc(String(m.load ?? "—"))}</b></div>
+          <div class="row"><label>RAM</label><div class="bar ${ramPct > 90 ? "hot" : ""}"><i style="width:${ramPct}%"></i></div><b>${m.mem_total ? esc(fmtGiB(m.mem_used) + "/" + fmtGiB(m.mem_total)) : "—"}</b></div>
+          <div class="row"><label>TEMP</label><div class="bar temp ${isHot(m) ? "hot" : ""}"><i style="width:${tempPct(m.cpu_temp_c)}%"></i></div><b>${esc(fmtTemp(m.cpu_temp_c))}</b></div>
+          <div class="row"><label>GPU</label><div class="bar gpu ${gpuPct > 85 ? "hot" : ""}"><i style="width:${Math.max(0, Math.min(100, gpuPct))}%"></i></div><b>${esc(fmtPct(m.gpu_active_pct))}</b></div>
+          <div class="row"><label>DISK</label><div class="bar disk ${diskPct > 92 ? "hot" : ""}"><i style="width:${diskPct}%"></i></div><b>${m.disk_total ? esc(fmtGiB(m.disk_used) + "/" + fmtGiB(m.disk_total)) : "—"}</b></div>
+          <div class="detail">
+            <span>CPU <b>${esc(fmtWatts(m.cpu_power_mw))}</b></span>
+            <span>GPU <b>${esc(fmtWatts(m.gpu_power_mw))}</b></span>
+            <span>PWR <b>${esc(m.battery_pct ? m.battery_pct + "%" : (m.power_source || "—"))}</b></span>
+          </div>
+          <div class="slots">${slotHtml}</div>
+          <div class="tasks">${taskHtml}</div>
+        </article>`;
+      }).join("") || `<p class="empty">No Macs in the pool yet. Join a worker, then refresh.</p>`;
+      const events = data.events || [];
+      $("events").innerHTML = events.length
+        ? events.map((e) => `<div class="event"><time>${esc(e.at || "")}</time>${esc(e.message || "")}</div>`).join("")
+        : `<div class="empty">Hops show up here when claude or codex leave this Mac.</div>`;
+      $("stamp").textContent = "Updated " + (data.generated_at || "just now") + " · auto-refresh 2s";
+      $("fail").hidden = true;
+    }
+
+    async function tick() {
+      try {
+        const res = await fetch("/api/pool", { cache: "no-store" });
+        if (!res.ok) throw new Error("pool " + res.status);
+        render(await res.json());
+      } catch (err) {
+        $("fail").hidden = false;
+        $("fail").textContent = "Dashboard could not read the pool: " + err.message;
+      }
+    }
+    tick();
+    setInterval(tick, 2000);
+  </script>
+</body>
+</html>

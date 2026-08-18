@@ -1,0 +1,31 @@
+#!/bin/bash
+
+set -euo pipefail
+
+case "${1:-}" in
+  --version|-V)
+    printf 'codex-cli 0.test\n'
+    exit 0
+    ;;
+  login)
+    exit 0
+    ;;
+esac
+
+if [ "${1:-}" = "exec" ]; then
+  shift
+  project="$PWD"
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      -C|--cd) project="$2"; shift 2 ;;
+      -) shift ;;
+      *) shift ;;
+    esac
+  done
+  printf 'codex[%s]: ' "$project"
+  cat
+  printf '\n'
+  exit 0
+fi
+
+exit 1
