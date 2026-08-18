@@ -2,7 +2,7 @@
 
 set -euo pipefail
 
-VERSION="0.4.6"
+VERSION="0.4.7"
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/airlift"
 CONFIG_FILE="$CONFIG_DIR/config"
 NODES_DIR="$CONFIG_DIR/nodes"
@@ -1930,14 +1930,14 @@ ensure_worktree() {
     rel="${local_cwd#"$local_root"/}"
   fi
   local remote_root remote_cwd
-  remote_root="\$HOME/airlift/worktrees/${repo_name}/${lease}"
+  remote_root="\$HOME/.airlift/worktrees/${repo_name}/${lease}"
   if [ -n "$rel" ] && [ "$rel" != "$local_cwd" ]; then
     remote_cwd="${remote_root}/${rel}"
   else
     remote_cwd="$remote_root"
   fi
   local remote_rel expanded remote_home
-  remote_rel="airlift/worktrees/${repo_name}/${lease}"
+  remote_rel=".airlift/worktrees/${repo_name}/${lease}"
   remote_home="$(ssh -o BatchMode=yes "$AIRLIFT_ALIAS" 'printf %s "$HOME"' </dev/null)"
   expanded="$remote_home/$remote_rel"
   ssh -o BatchMode=yes -o ConnectTimeout=8 "$AIRLIFT_ALIAS" \
@@ -1972,7 +1972,7 @@ ensure_scratch_worktree() {
 
   local remote_home expanded
   remote_home="$(ssh -o BatchMode=yes "$AIRLIFT_ALIAS" 'printf %s "$HOME"' </dev/null)" || return 1
-  expanded="$remote_home/airlift/worktrees/scratch/$lease"
+  expanded="$remote_home/.airlift/worktrees/scratch/$lease"
   ssh -o BatchMode=yes -o ConnectTimeout=8 "$AIRLIFT_ALIAS" \
     "mkdir -p $(shell_quote "$expanded")" </dev/null >/dev/null || return 1
   AIRLIFT_REMOTE_PROJECT="$expanded"
@@ -1983,7 +1983,7 @@ cleanup_scratch_worktree() {
   local remote_root="$1"
   [ -n "${AIRLIFT_TEST_METRICS_DIR:-}" ] && return 0
   case "$remote_root" in
-    */airlift/worktrees/scratch/*) ;;
+    */.airlift/worktrees/scratch/*) ;;
     *) return 0 ;;
   esac
   ssh -o BatchMode=yes "$AIRLIFT_ALIAS" \

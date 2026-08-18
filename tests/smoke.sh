@@ -55,7 +55,7 @@ printf '%s\n' "$WORKER_ONE_COMMAND_DRY_RUN" | grep -F "systemsetup -setremotelog
 WORKER_WRAPPER_DRY_RUN="$("$ROOT/install.sh" --worker --dry-run)"
 printf '%s\n' "$WORKER_WRAPPER_DRY_RUN" | grep -F "systemsetup -setremotelogin on" >/dev/null
 
-"$ROOT/airlift" --version | grep -F "airlift 0.4.6"
+"$ROOT/airlift" --version | grep -F "airlift 0.4.7"
 "$ROOT/airlift" --help | grep -F "Airlift"
 "$ROOT/airlift" --help | grep -F "dashboard"
 "$ROOT/airlift" --help | grep -F "forget"
@@ -132,7 +132,7 @@ assert spare["gpu_name"] == "Apple M2 10c"
 assert spare["disk_total"] == 107374182400
 assert spare["battery_pct"] == 100
 assert spare["tasks"][0]["agent"] == "claude"
-assert data["version"] == "0.4.6"
+assert data["version"] == "0.4.7"
 '
 
 printf '0\t8\t0.2\t24\t1\t0\tBeefy Mac\t4294967296\t34359738368\t-\t-\t-\t80\t180\t900\tApple M3 Max 40c\t32212254720\t214748364800\t91\tAC Power\t\n' >"$METRICS_DIR/beefy"
