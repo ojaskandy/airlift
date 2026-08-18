@@ -2,7 +2,7 @@
 
 set -euo pipefail
 
-VERSION="0.4.2"
+VERSION="0.4.3"
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/airlift"
 CONFIG_FILE="$CONFIG_DIR/config"
 NODES_DIR="$CONFIG_DIR/nodes"
@@ -61,6 +61,7 @@ Airlift — route engineering agents across a private Mac pool over SSH.
 Usage:
   airlift setup <user@mac-host> [options]       Pair the first worker (compatible with v0.2)
   airlift join <user@mac-host> [options]        Add another Mac to the pool
+  airlift forget <worker>                       Remove a Mac from this controller
   airlift nodes [--json]                         Show live pool load and availability
   airlift dashboard [--port N]                   Open the local pool board in a browser
   airlift run [options] <message>                Route one task to the least-used Mac
@@ -292,6 +293,25 @@ Host $alias
 $end
 EOF
 
+  chmod 600 "$temp"
+  mv "$temp" "$SSH_CONFIG"
+}
+
+remove_ssh_config() {
+  local alias="$1"
+  validate_alias "$alias"
+  [ -f "$SSH_CONFIG" ] || return 0
+
+  local start="# >>> airlift:${alias} >>>"
+  local end="# <<< airlift:${alias} <<<"
+  local temp
+  cp "$SSH_CONFIG" "$SSH_CONFIG.airlift.bak"
+  temp="$(mktemp "$HOME/.ssh/config.XXXXXX")"
+  awk -v start="$start" -v end="$end" '
+    $0 == start { skipping = 1; next }
+    $0 == end { skipping = 0; next }
+    !skipping { print }
+  ' "$SSH_CONFIG" >"$temp"
   chmod 600 "$temp"
   mv "$temp" "$SSH_CONFIG"
 }
@@ -593,8 +613,8 @@ join_cmd() {
     AIRLIFT_PROJECT="~"
     save_config
   else
-    load_config
-    if [ "$mode" = "setup" ]; then
+    load_config optional || true
+    if [ "$mode" = "setup" ] || [ -z "${AIRLIFT_DEFAULT_NODE:-}" ]; then
       AIRLIFT_DEFAULT_NODE="$alias"
       save_config
     fi
@@ -637,6 +657,32 @@ join_cmd() {
   say "  ${BOLD}./airlift run --project '~/Developer/your-project' 'Your task'${RESET}"
   say "Or open the Codex + Claude cockpit:"
   say "  ${BOLD}./airlift open '~/Developer/your-project'${RESET}"
+}
+
+forget_cmd() {
+  [ "$#" -eq 1 ] || die "Usage: airlift forget <worker>"
+  local alias="$1"
+  validate_alias "$alias"
+  [ -f "$(node_file "$alias")" ] || die "Unknown worker '$alias'. Run: airlift nodes"
+
+  load_config optional || true
+  rm -f "$(node_file "$alias")"
+  remove_ssh_config "$alias"
+
+  if [ "${AIRLIFT_DEFAULT_NODE:-}" = "$alias" ] ||
+    [ -z "${AIRLIFT_DEFAULT_NODE:-}" ] ||
+    [ ! -f "$(node_file "$AIRLIFT_DEFAULT_NODE")" ]
+  then
+    AIRLIFT_DEFAULT_NODE="$(list_node_aliases | head -n 1)"
+  fi
+  save_config
+
+  ok "Forgot worker '$alias'."
+  if [ -n "$AIRLIFT_DEFAULT_NODE" ]; then
+    info "Default worker is now '$AIRLIFT_DEFAULT_NODE'."
+  else
+    info "No workers remain. Agent commands will run on this Mac."
+  fi
 }
 
 metrics_script() {
@@ -844,7 +890,7 @@ probe_node() {
   metrics_file="$(mktemp "$CONFIG_DIR/metrics.XXXXXX")"
   if ! metrics_script | ssh -o BatchMode=yes -o ConnectTimeout=5 "$AIRLIFT_ALIAS" \
     "AIRLIFT_METRICS=1 AIRLIFT_PROJECT=$quoted_project AIRLIFT_SLOTS=$quoted_slots bash -s" \
-    >"$metrics_file"
+    >"$metrics_file" 2>/dev/null
   then
     rm -f "$metrics_file"
     return 1
@@ -1710,6 +1756,9 @@ record_real_binaries() {
 
 sync_root_for() {
   local cwd="$1"
+  case "${cwd%/}" in
+    "${HOME%/}"|""|"/") return 1 ;;
+  esac
   if [ -d "$cwd/.git" ] || git -C "$cwd" rev-parse --show-toplevel >/dev/null 2>&1; then
     git -C "$cwd" rev-parse --show-toplevel
     return 0
@@ -1817,6 +1866,35 @@ ensure_worktree() {
   fi
 }
 
+ensure_scratch_worktree() {
+  local local_cwd="$1"
+  local lease="$2"
+  AIRLIFT_REMOTE_PROJECT="$local_cwd"
+  AIRLIFT_REMOTE_CWD="$local_cwd"
+  if [ -n "${AIRLIFT_TEST_METRICS_DIR:-}" ]; then
+    return 0
+  fi
+
+  local remote_home expanded
+  remote_home="$(ssh -o BatchMode=yes "$AIRLIFT_ALIAS" 'printf %s "$HOME"' </dev/null)" || return 1
+  expanded="$remote_home/airlift/worktrees/scratch/$lease"
+  ssh -o BatchMode=yes -o ConnectTimeout=8 "$AIRLIFT_ALIAS" \
+    "mkdir -p $(shell_quote "$expanded")" </dev/null >/dev/null || return 1
+  AIRLIFT_REMOTE_PROJECT="$expanded"
+  AIRLIFT_REMOTE_CWD="$expanded"
+}
+
+cleanup_scratch_worktree() {
+  local remote_root="$1"
+  [ -n "${AIRLIFT_TEST_METRICS_DIR:-}" ] && return 0
+  case "$remote_root" in
+    */airlift/worktrees/scratch/*) ;;
+    *) return 0 ;;
+  esac
+  ssh -o BatchMode=yes "$AIRLIFT_ALIAS" \
+    "rm -rf -- $(shell_quote "$remote_root")" </dev/null >/dev/null 2>&1 || true
+}
+
 write_back_worktree() {
   local local_root="$1"
   local remote_root="$2"
@@ -1843,7 +1921,7 @@ run_agent_local() {
   shift
   local real
   real="$(real_bin_path "$agent")" || die "No local $agent binary. Install it or join a worker."
-  notify_airlift "pool empty or local mode, running $agent here"
+  notify_airlift "${AIRLIFT_LOCAL_REASON:-pool empty or local mode}, running $agent here"
   export AIRLIFT_IN_EXEC=1
   cd "$cwd"
   if [ "${AIRLIFT_ONESHOT:-0}" = "1" ]; then
@@ -1858,9 +1936,13 @@ run_agent_local() {
 hop_agent() {
   local agent="$1"
   local remote_cwd="$2"
-  local quoted_agent quoted_cwd remote_script
+  shift 2
+  local quoted_agent quoted_cwd quoted_args="" remote_script remote_command arg
   quoted_agent="$(shell_quote "$agent")"
   quoted_cwd="$(shell_quote "$remote_cwd")"
+  for arg in "$@"; do
+    quoted_args="$quoted_args $(shell_quote "$arg")"
+  done
   remote_script='set -euo pipefail
 export PATH="$HOME/.airlift/runtime/bin:$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$HOME/.codex/bin:$PATH"
 project="$AIRLIFT_CWD"
@@ -1884,7 +1966,7 @@ case "$AIRLIFT_AGENT" in
     if [ "${AIRLIFT_ONESHOT:-0}" = "1" ]; then
       codex exec -C "$project" -
     else
-      exec codex
+      exec codex "$@"
     fi
     ;;
   claude)
@@ -1892,23 +1974,20 @@ case "$AIRLIFT_AGENT" in
     if [ "${AIRLIFT_ONESHOT:-0}" = "1" ]; then
       claude -p
     else
-      exec claude
+      exec claude "$@"
     fi
     ;;
   *) printf "Unknown agent: %s\n" "$AIRLIFT_AGENT" >&2; exit 1 ;;
 esac'
+  remote_command="AIRLIFT_AGENT=$quoted_agent AIRLIFT_CWD=$quoted_cwd AIRLIFT_ONESHOT=$(shell_quote "${AIRLIFT_ONESHOT:-0}") bash -c $(shell_quote "$remote_script") airlift$quoted_args"
   if [ -n "${AIRLIFT_SSH_TTY:-}" ]; then
-    ssh -t "$AIRLIFT_ALIAS" \
-      "AIRLIFT_AGENT=$quoted_agent AIRLIFT_CWD=$quoted_cwd AIRLIFT_ONESHOT=$(shell_quote "${AIRLIFT_ONESHOT:-0}") bash -c $(shell_quote "$remote_script")"
+    ssh -t "$AIRLIFT_ALIAS" "$remote_command"
   else
-    ssh "$AIRLIFT_ALIAS" \
-      "AIRLIFT_AGENT=$quoted_agent AIRLIFT_CWD=$quoted_cwd AIRLIFT_ONESHOT=$(shell_quote "${AIRLIFT_ONESHOT:-0}") bash -c $(shell_quote "$remote_script")"
+    ssh "$AIRLIFT_ALIAS" "$remote_command"
   fi
 }
 
 exec_cmd() {
-  load_config
-  require ssh
   local agent="claude" worker="auto" cwd="$PWD"
   local -a agent_args=()
   while [ "$#" -gt 0 ]; do
@@ -1923,6 +2002,11 @@ exec_cmd() {
   done
   case "$agent" in claude|codex) ;; *) die "Agent must be claude or codex." ;; esac
   [ -d "$cwd" ] || die "cwd does not exist: $cwd"
+  if ! load_config optional; then
+    AIRLIFT_LOCAL_REASON="no workers configured"
+    run_agent_local "$agent" "$cwd" "${agent_args[@]+"${agent_args[@]}"}"
+  fi
+  require ssh
   local_cmd_exec "$agent" "$worker" "$cwd" 0 "${agent_args[@]+"${agent_args[@]}"}"
 }
 
@@ -1930,8 +2014,11 @@ local_cmd_exec() {
   local agent="$1" worker="$2" cwd="$3" oneshot="$4"
   shift 4
   AIRLIFT_ONESHOT="$oneshot"
-  local root lease lock_file owns=0 remote_root=""
-  root="$(sync_root_for "$cwd")"
+  local root lease lock_file="" owns=0 remote_root="" scratch=0
+  if ! root="$(sync_root_for "$cwd")"; then
+    scratch=1
+    root="$cwd"
+  fi
   if force_local_requested; then
     run_agent_local "$agent" "$cwd" "$@"
   fi
@@ -1940,27 +2027,42 @@ local_cmd_exec() {
   fi
   load_node "$AIRLIFT_SELECTED_ALIAS"
   lease="$(lease_id | tr -d '\n')"
-  lock_file="$(lock_path_for "$root")"
-  if try_overlay_lock "$root" "$lease"; then
-    owns=1
-    trap 'release_overlay_lock "'"$lock_file"'"' EXIT
-  fi
-  if ! ensure_worktree "$root" "$cwd" "$lease"; then
-    release_overlay_lock "$lock_file"
-    run_agent_local "$agent" "$cwd" "$@"
+  if [ "$scratch" = "1" ]; then
+    if ! ensure_scratch_worktree "$cwd" "$lease"; then
+      AIRLIFT_LOCAL_REASON="worker scratch setup failed"
+      run_agent_local "$agent" "$cwd" "$@"
+    fi
+  else
+    lock_file="$(lock_path_for "$root")"
+    if try_overlay_lock "$root" "$lease"; then
+      owns=1
+      trap 'release_overlay_lock "'"$lock_file"'"' EXIT
+    fi
+    if ! ensure_worktree "$root" "$cwd" "$lease"; then
+      release_overlay_lock "$lock_file"
+      run_agent_local "$agent" "$cwd" "$@"
+    fi
   fi
   remote_root="$AIRLIFT_REMOTE_PROJECT"
-  notify_airlift "running on $AIRLIFT_ALIAS ($AIRLIFT_SELECTED_MACHINE)"
+  if [ "$scratch" = "1" ]; then
+    notify_airlift "running on $AIRLIFT_ALIAS ($AIRLIFT_SELECTED_MACHINE); home folder not synced"
+  else
+    notify_airlift "running on $AIRLIFT_ALIAS ($AIRLIFT_SELECTED_MACHINE)"
+  fi
   local hop_status=0
   if [ -t 0 ] && [ "$oneshot" != "1" ]; then
     AIRLIFT_SSH_TTY=1
   else
     AIRLIFT_SSH_TTY=""
   fi
-  hop_agent "$agent" "$AIRLIFT_REMOTE_CWD" || hop_status=$?
-  write_back_worktree "$root" "$remote_root" "$owns" || true
-  release_overlay_lock "$lock_file"
-  if [ "$owns" != "1" ]; then
+  hop_agent "$agent" "$AIRLIFT_REMOTE_CWD" "$@" || hop_status=$?
+  if [ "$scratch" = "1" ]; then
+    cleanup_scratch_worktree "$remote_root"
+  else
+    write_back_worktree "$root" "$remote_root" "$owns" || true
+    release_overlay_lock "$lock_file"
+  fi
+  if [ "$scratch" != "1" ] && [ "$owns" != "1" ]; then
     notify_airlift "edits on branch airlift/$lease (another agent owns this folder)"
   fi
   return "$hop_status"
@@ -2318,6 +2420,7 @@ main() {
   case "$command" in
     setup) join_cmd setup "$@" ;;
     join|add) join_cmd join "$@" ;;
+    forget|remove) forget_cmd "$@" ;;
     nodes|pool|status) nodes_cmd "$@" ;;
     dashboard|dash|board) dashboard_cmd "$@" ;;
     run|dispatch|send) run_cmd "$@" ;;

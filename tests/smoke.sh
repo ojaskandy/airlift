@@ -53,9 +53,10 @@ printf '%s\n' "$WORKER_ONE_COMMAND_DRY_RUN" | grep -F "systemsetup -setremotelog
 WORKER_WRAPPER_DRY_RUN="$("$ROOT/install.sh" --worker --dry-run)"
 printf '%s\n' "$WORKER_WRAPPER_DRY_RUN" | grep -F "systemsetup -setremotelogin on" >/dev/null
 
-"$ROOT/airlift" --version | grep -F "airlift 0.4.2"
+"$ROOT/airlift" --version | grep -F "airlift 0.4.3"
 "$ROOT/airlift" --help | grep -F "Airlift"
 "$ROOT/airlift" --help | grep -F "dashboard"
+"$ROOT/airlift" --help | grep -F "forget"
 [ -f "$ROOT/dashboard.html" ]
 
 # shellcheck disable=SC1091
@@ -126,7 +127,7 @@ assert spare["gpu_name"] == "Apple M2 10c"
 assert spare["disk_total"] == 107374182400
 assert spare["battery_pct"] == 100
 assert spare["tasks"][0]["agent"] == "claude"
-assert data["version"] == "0.4.2"
+assert data["version"] == "0.4.3"
 '
 
 printf '0\t8\t0.2\t24\t1\t0\tBeefy Mac\t4294967296\t34359738368\t-\t-\t-\t80\t180\t900\tApple M3 Max 40c\t32212254720\t214748364800\t91\tAC Power\t\n' >"$METRICS_DIR/beefy"
@@ -203,11 +204,38 @@ grep -F "beefy AIRLIFT_AGENT=" "$SSH_LOG" >/dev/null
 
 # Offline pool falls back to the local binary.
 rm -f "$METRICS_DIR/spare-air" "$METRICS_DIR/beefy"
-LOCAL_FALLBACK="$(airlift_test run --project "~/Developer/Dylan's test project" "stay local")"
+OFFLINE_STDERR="$TEMP_HOME/offline.stderr"
+LOCAL_FALLBACK="$(airlift_test run --project "~/Developer/Dylan's test project" "stay local" 2>"$OFFLINE_STDERR")"
 printf '%s\n' "$LOCAL_FALLBACK" | grep -F "codex[$TEMP_HOME/Developer/Dylan's test project]: stay local" >/dev/null
+if grep -F "Could not resolve hostname" "$OFFLINE_STDERR" >/dev/null; then
+  printf 'offline worker probe leaked an SSH diagnostic\n' >&2
+  exit 1
+fi
+
+# A bare agent launched from HOME must not sync the controller's entire home folder.
+printf '0\t8\t0.2\t24\t1\t0\tBeefy Mac\t4294967296\t34359738368\t45\tNominal\t2\t80\t180\t900\tApple M3 Max 40c\t32212254720\t214748364800\t91\tAC Power\t\n' >"$METRICS_DIR/beefy"
+: >"$SSH_LOG"
+HOME_EXEC="$(airlift_test exec --agent codex --cwd "$TEMP_HOME" -- --version 2>&1)"
+printf '%s\n' "$HOME_EXEC" | grep -F "home folder not synced" >/dev/null
+grep -F "beefy AIRLIFT_AGENT=" "$SSH_LOG" >/dev/null
 
 airlift_test stop >/dev/null
 airlift_test shutdown --worker beefy >/dev/null
+
+# Retiring a worker removes its generated SSH entry and repairs the default.
+airlift_test forget spare-air >/dev/null
+[ ! -f "$TEMP_HOME/.config/airlift/nodes/spare-air" ]
+if grep -F "Host spare-air" "$TEMP_HOME/.ssh/config" >/dev/null; then
+  printf 'forgotten worker remains in SSH config\n' >&2
+  exit 1
+fi
+grep -F "AIRLIFT_DEFAULT_NODE='beefy'" "$TEMP_HOME/.config/airlift/config" >/dev/null
+
+# Forgetting the final worker leaves installed agent shims usable in local mode.
+airlift_test forget beefy >/dev/null
+grep -F "AIRLIFT_DEFAULT_NODE=''" "$TEMP_HOME/.config/airlift/config" >/dev/null
+NO_WORKER_EXEC="$(airlift_test exec --agent codex --cwd "$TEMP_HOME/Developer/Dylan's test project" -- --version 2>&1)"
+printf '%s\n' "$NO_WORKER_EXEC" | grep -F "no workers configured" >/dev/null
 
 # A v0.2 single-worker config migrates without losing its target or project.
 LEGACY_HOME="$TEMP_HOME/legacy"
@@ -224,11 +252,19 @@ PATH="$ROOT/tests/fakes:$PATH" HOME="$LEGACY_HOME" XDG_CONFIG_HOME="$LEGACY_HOME
 grep -F "AIRLIFT_CONFIG_VERSION='3'" "$LEGACY_HOME/.config/airlift/config" >/dev/null
 grep -F "AIRLIFT_TARGET='worker@old.local'" "$LEGACY_HOME/.config/airlift/nodes/old-air" >/dev/null
 
-HOME="$TEMP_HOME" "$ROOT/install.sh" >/dev/null
+INSTALL_PATH="$TEMP_HOME/.local/bin:$ROOT/tests/fakes:/usr/bin:/bin"
+HOME="$TEMP_HOME" PATH="$INSTALL_PATH" "$ROOT/install.sh" >/dev/null
 [ -x "$TEMP_HOME/.local/bin/airlift" ]
 [ -x "$TEMP_HOME/.local/bin/claude" ]
 [ -x "$TEMP_HOME/.local/bin/codex" ]
 [ -f "$TEMP_HOME/.local/share/airlift/dashboard.html" ]
 grep -F "exec --agent claude" "$TEMP_HOME/.local/bin/claude" >/dev/null
+grep -F "AIRLIFT_REAL_CLAUDE='$ROOT/tests/fakes/claude'" "$TEMP_HOME/.config/airlift/real-binaries" >/dev/null
+grep -F "AIRLIFT_REAL_CODEX='$ROOT/tests/fakes/codex'" "$TEMP_HOME/.config/airlift/real-binaries" >/dev/null
+
+# Reinstalling while Airlift's shims are first on PATH keeps the real binaries.
+HOME="$TEMP_HOME" PATH="$INSTALL_PATH" "$ROOT/install.sh" >/dev/null
+grep -F "AIRLIFT_REAL_CLAUDE='$ROOT/tests/fakes/claude'" "$TEMP_HOME/.config/airlift/real-binaries" >/dev/null
+grep -F "AIRLIFT_REAL_CODEX='$ROOT/tests/fakes/codex'" "$TEMP_HOME/.config/airlift/real-binaries" >/dev/null
 
 printf 'smoke tests passed\n'

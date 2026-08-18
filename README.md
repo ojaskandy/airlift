@@ -85,7 +85,9 @@ the user running the installer when necessary. Review that later under
 
 `claude` and `codex` on the controller copy the current git worktree to the
 chosen Mac, run there, and copy edits back. You do not have to pre-clone the
-repo onto every worker for that hop.
+repo onto every worker for that hop. Start the agent from the project directory.
+Launches from your home directory use an empty temporary worker folder, so
+Airlift never copies the entire home folder to another Mac.
 
 `airlift run` is the explicit one-shot path. To pin a shared checkout on every
 worker instead of copying per job:
@@ -246,6 +248,7 @@ codex exec -C ~/Developer/your-repo -            # Same
 ./airlift local on|off                           # Force this Mac / resume hopping
 ./airlift open PATH                              # Auto-route a new cockpit
 ./airlift clone GIT_URL --worker all             # Prepare every worker
+./airlift forget spare-air                       # Remove a retired worker
 ./airlift doctor --worker beefy                   # Check one worker
 ./airlift shell beefy                             # Normal worker shell
 ./airlift stop                                    # Close the active tunnel
@@ -314,6 +317,8 @@ Run:
 Common failures:
 
 - **Offline:** wake the Mac and enable Remote Login.
+- **Retired worker:** run `airlift forget WORKER_NAME` to remove its saved
+  route from this controller.
 - **Tailscale worker is offline:** confirm both devices are connected and run
   `tailscale ping WORKER_NAME` when the CLI is available.
 - **Project missing:** `claude` / `codex` hop copies the worktree. For `airlift

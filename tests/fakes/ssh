@@ -39,6 +39,7 @@ if [[ "$last" == *"AIRLIFT_METRICS=1"* ]] && [ -n "${AIRLIFT_TEST_METRICS_DIR:-}
       exit 0
     fi
   done
+  printf 'ssh: Could not resolve hostname unavailable.local: nodename nor servname provided, or not known\n' >&2
   exit 255
 fi
 

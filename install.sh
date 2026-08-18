@@ -125,10 +125,40 @@ EOF
 # Record real binaries before shims hide them.
 mkdir -p "${XDG_CONFIG_HOME:-$HOME/.config}/airlift"
 REAL_FILE="${XDG_CONFIG_HOME:-$HOME/.config}/airlift/real-binaries"
-claude_real="$(command -v claude 2>/dev/null || true)"
-codex_real="$(command -v codex 2>/dev/null || true)"
-case "${claude_real}" in *airlift*|"$BIN_DIR/claude") claude_real="" ;; esac
-case "${codex_real}" in *airlift*|"$BIN_DIR/codex") codex_real="" ;; esac
+AIRLIFT_REAL_CLAUDE=""
+AIRLIFT_REAL_CODEX=""
+if [ -f "$REAL_FILE" ]; then
+  # shellcheck disable=SC1090
+  source "$REAL_FILE"
+fi
+
+find_real_agent() {
+  local agent="$1"
+  local recorded="$2"
+  if [ -n "$recorded" ] && [ -x "$recorded" ] && [ "$recorded" != "$BIN_DIR/$agent" ]; then
+    printf '%s' "$recorded"
+    return 0
+  fi
+
+  local directory candidate
+  local old_ifs="$IFS"
+  IFS=:
+  for directory in $PATH; do
+    [ -n "$directory" ] || directory="."
+    candidate="$directory/$agent"
+    [ "$candidate" != "$BIN_DIR/$agent" ] || continue
+    if [ -x "$candidate" ] && [ ! -d "$candidate" ]; then
+      IFS="$old_ifs"
+      printf '%s' "$candidate"
+      return 0
+    fi
+  done
+  IFS="$old_ifs"
+  return 1
+}
+
+claude_real="$(find_real_agent claude "${AIRLIFT_REAL_CLAUDE:-}" || true)"
+codex_real="$(find_real_agent codex "${AIRLIFT_REAL_CODEX:-}" || true)"
 {
   printf "AIRLIFT_REAL_CLAUDE='%s'\n" "$claude_real"
   printf "AIRLIFT_REAL_CODEX='%s'\n" "$codex_real"
