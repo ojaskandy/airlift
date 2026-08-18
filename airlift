@@ -2,7 +2,7 @@
 
 set -euo pipefail
 
-VERSION="0.4.3"
+VERSION="0.4.4"
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/airlift"
 CONFIG_FILE="$CONFIG_DIR/config"
 NODES_DIR="$CONFIG_DIR/nodes"
@@ -913,30 +913,34 @@ probe_node() {
   [ -n "${machine:-}" ] || machine="$AIRLIFT_ALIAS"
   mem_used="${mem_used:-0}"
   mem_total="${mem_total:-0}"
-  score="$(
-    awk -v busy="$busy" -v slots="$slots" -v load_value="$load" -v cores="$cores" \
-      -v mem_used="$mem_used" -v mem_total="$mem_total" -v temp="$cpu_temp_c" \
-      -v thermal="$thermal_pressure" -v gpu="$gpu_active_pct" \
-      'BEGIN {
-        if (slots < 1) slots = 1
-        if (cores < 1) cores = 1
-        score = (busy / slots) * 1000 + (load_value / cores) * 100
-        if (mem_total > 0) {
-          mem_ratio = mem_used / mem_total
-          if (mem_ratio > 0.85) score += (mem_ratio - 0.85) * 2000
-        }
-        if (temp + 0 > 80) score += (temp - 80) * 20
-        lower = tolower(thermal)
-        if (lower != "" && lower !~ /nominal|normal|ok/) score += 500
-        if (gpu + 0 > 80) score += (gpu - 80) * 5
-        printf "%.1f", score
-      }'
-  )"
+  score="$(score_metrics "$busy" "$slots" "$load" "$cores" "$mem_used" "$mem_total" "$cpu_temp_c" "$thermal_pressure" "$gpu_active_pct")"
   printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
     "$AIRLIFT_ALIAS" "$score" "$busy" "$slots" "$load" "$cores" "$ready" "$machine" "$AIRLIFT_TRANSPORT" "$AIRLIFT_TARGET" \
     "$mem_used" "$mem_total" "${cpu_temp_c:-"-"}" "${thermal_pressure:-"-"}" "${gpu_active_pct:-"-"}" "${gpu_power_mw:-"-"}" \
     "${gpu_freq_mhz:-"-"}" "${cpu_power_mw:-"-"}" "${gpu_name:-"-"}" "${disk_used:-0}" "${disk_total:-0}" \
     "${battery_pct:-0}" "${power_source:-"-"}" "${tasks:-}"
+}
+
+score_metrics() {
+  local busy="$1" slots="$2" load="$3" cores="$4" mem_used="$5" mem_total="$6"
+  local temp="$7" thermal="$8" gpu="$9"
+  awk -v busy="$busy" -v slots="$slots" -v load_value="$load" -v cores="$cores" \
+    -v mem_used="$mem_used" -v mem_total="$mem_total" -v temp="$temp" \
+    -v thermal="$thermal" -v gpu="$gpu" \
+    'BEGIN {
+      if (slots < 1) slots = 1
+      if (cores < 1) cores = 1
+      score = (busy / slots) * 1000 + (load_value / cores) * 100
+      if (mem_total > 0) {
+        mem_ratio = mem_used / mem_total
+        if (mem_ratio > 0.85) score += (mem_ratio - 0.85) * 2000
+      }
+      if (temp + 0 > 80) score += (temp - 80) * 20
+      lower = tolower(thermal)
+      if (lower != "" && lower !~ /nominal|normal|ok/) score += 500
+      if (gpu + 0 > 80) score += (gpu - 80) * 5
+      printf "%.1f", score
+    }'
 }
 
 probe_pool() {
@@ -1053,6 +1057,56 @@ select_node() {
   clear_probe_pool
 }
 
+select_execution_target() {
+  local agent="$1"
+  local requested="$2"
+  local project="$3"
+  AIRLIFT_EXECUTION_LOCAL=0
+  AIRLIFT_LOCAL_AGENT_BIN=""
+  AIRLIFT_ROUTING_REASON=""
+
+  if [ "$requested" != "auto" ]; then
+    select_node "$requested" "$project" 0
+    return 0
+  fi
+
+  local local_record="" local_score="" remote_found=0 remote_alias="" remote_score=""
+  AIRLIFT_LOCAL_AGENT_BIN="$(real_bin_path "$agent" || true)"
+  if [ -n "$AIRLIFT_LOCAL_AGENT_BIN" ]; then
+    local_record="$(local_execution_record "$project")"
+    local_score="$(printf '%s\n' "$local_record" | awk -F '\t' '{ print $2 }')"
+  fi
+  if select_node auto "$project" 0; then
+    remote_found=1
+    remote_alias="$AIRLIFT_SELECTED_ALIAS"
+    remote_score="$AIRLIFT_SELECTED_SCORE"
+  fi
+
+  if [ -n "$local_record" ] && {
+    [ "$remote_found" = "0" ] ||
+      awk -v local_score="$local_score" -v remote_score="$AIRLIFT_SELECTED_SCORE" \
+        'BEGIN { exit !(local_score <= remote_score) }';
+  }; then
+    read_selected_record "$local_record"
+    AIRLIFT_EXECUTION_LOCAL=1
+    if [ "$remote_found" = "1" ]; then
+      AIRLIFT_ROUTING_REASON="auto selected this Mac: score $local_score <= $remote_alias $remote_score"
+    else
+      AIRLIFT_ROUTING_REASON="auto selected this Mac: no remote worker is available"
+    fi
+    return 0
+  fi
+  if [ "$remote_found" = "1" ]; then
+    if [ -n "$local_record" ]; then
+      AIRLIFT_ROUTING_REASON="auto selected $remote_alias: score $remote_score < this Mac $local_score"
+    else
+      AIRLIFT_ROUTING_REASON="auto selected $remote_alias: no local $agent binary is available"
+    fi
+    return 0
+  fi
+  return 1
+}
+
 format_mem() {
   local used="${1:-0}" total="${2:-0}"
   awk -v u="$used" -v t="$total" 'BEGIN {
@@ -1096,7 +1150,31 @@ format_power() {
 }
 
 local_metrics_line() {
+  if [ -n "${AIRLIFT_TEST_LOCAL_METRICS_FILE:-}" ] && [ -f "$AIRLIFT_TEST_LOCAL_METRICS_FILE" ]; then
+    cat "$AIRLIFT_TEST_LOCAL_METRICS_FILE"
+    return 0
+  fi
   metrics_script | AIRLIFT_PROJECT="${AIRLIFT_PROJECT:-~}" AIRLIFT_SLOTS="auto" bash -s
+}
+
+local_execution_record() {
+  local project="$1"
+  local line busy slots load cores ready jobs machine mem_used mem_total cpu_temp_c thermal_pressure
+  local gpu_active_pct gpu_power_mw gpu_freq_mhz cpu_power_mw gpu_name disk_used disk_total battery_pct power_source tasks score
+  line="$(AIRLIFT_PROJECT="$project" local_metrics_line)"
+  IFS=$'\t' read -r busy slots load cores ready jobs machine mem_used mem_total cpu_temp_c thermal_pressure \
+    gpu_active_pct gpu_power_mw gpu_freq_mhz cpu_power_mw gpu_name disk_used disk_total battery_pct power_source tasks <<<"$line"
+  [ "${cpu_temp_c:-}" = "-" ] && cpu_temp_c=""
+  [ "${thermal_pressure:-}" = "-" ] && thermal_pressure=""
+  [ "${gpu_active_pct:-}" = "-" ] && gpu_active_pct=""
+  score="$(score_metrics "${busy:-0}" "${slots:-1}" "${load:-0}" "${cores:-1}" \
+    "${mem_used:-0}" "${mem_total:-0}" "${cpu_temp_c:-}" "${thermal_pressure:-}" "${gpu_active_pct:-}")"
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "this-mac" "$score" "${busy:-0}" "${slots:-1}" "${load:-0}" "${cores:-1}" "${ready:-1}" \
+    "${machine:-this Mac}" "local" "this Mac" "${mem_used:-0}" "${mem_total:-0}" \
+    "${cpu_temp_c:-"-"}" "${thermal_pressure:-"-"}" "${gpu_active_pct:-"-"}" "${gpu_power_mw:-"-"}" \
+    "${gpu_freq_mhz:-"-"}" "${cpu_power_mw:-"-"}" "${gpu_name:-"-"}" "${disk_used:-0}" \
+    "${disk_total:-0}" "${battery_pct:-0}" "${power_source:-"-"}" "${tasks:-}"
 }
 
 metrics_sampler_script() {
@@ -1266,12 +1344,15 @@ pool_json() {
   load_config optional || true
   local dump
   dump="$(mktemp "${TMPDIR:-/tmp}/airlift-pool.XXXXXX")"
-  local local_line busy slots load cores ready jobs machine mem_used mem_total cpu_temp_c thermal_pressure
+  local local_line local_score busy slots load cores ready jobs machine mem_used mem_total cpu_temp_c thermal_pressure
   local gpu_active_pct gpu_power_mw gpu_freq_mhz cpu_power_mw gpu_name disk_used disk_total battery_pct power_source tasks
   local_line="$(local_metrics_line)"
   IFS=$'\t' read -r busy slots load cores ready jobs machine mem_used mem_total cpu_temp_c thermal_pressure \
     gpu_active_pct gpu_power_mw gpu_freq_mhz cpu_power_mw gpu_name disk_used disk_total battery_pct power_source tasks <<<"$local_line"
-  printf 'controller\tthis-mac\tlocal\t0\t%s\t%s\t%s\t%s\t%s\t%s\tlocal\tthis Mac\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+  local_score="$(score_metrics "${busy:-0}" "${slots:-1}" "${load:-0}" "${cores:-1}" \
+    "${mem_used:-0}" "${mem_total:-0}" "${cpu_temp_c:-}" "${thermal_pressure:-}" "${gpu_active_pct:-}")"
+  printf 'controller\tthis-mac\tlocal\t%s\t%s\t%s\t%s\t%s\t%s\t%s\tlocal\tthis Mac\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$local_score" \
     "${busy:-0}" "${slots:-1}" "${load:-0}" "${cores:-1}" "${ready:-1}" "${machine:-this Mac}" \
     "${mem_used:-0}" "${mem_total:-0}" "${cpu_temp_c:-}" "${thermal_pressure:-}" "${gpu_active_pct:-}" \
     "${gpu_power_mw:-}" "${gpu_freq_mhz:-}" "${cpu_power_mw:-}" "${gpu_name:-}" "${disk_used:-0}" \
@@ -1734,9 +1815,18 @@ real_bin_path() {
   fi
   local path
   path="$(command -v "$agent" || true)"
-  if [ -n "$path" ] && [ -x "$path" ]; then
+  if [ -n "$path" ] && [ -x "$path" ] && ! grep -F 'AIRLIFT_BIN=' "$path" >/dev/null 2>&1; then
     printf '%s' "$path"
     return 0
+  fi
+  local conductor_dir
+  conductor_dir="$HOME/Library/Application Support/com.conductor.app/agent-binaries/$agent"
+  if [ -d "$conductor_dir" ]; then
+    path="$(find "$conductor_dir" -type f -name "$agent" -perm -111 -print 2>/dev/null | sort -V | tail -n 1)"
+    if [ -n "$path" ] && [ -x "$path" ]; then
+      printf '%s' "$path"
+      return 0
+    fi
   fi
   return 1
 }
@@ -1895,6 +1985,79 @@ cleanup_scratch_worktree() {
     "rm -rf -- $(shell_quote "$remote_root")" </dev/null >/dev/null 2>&1 || true
 }
 
+stage_remote_agent_auth() {
+  local agent="$1"
+  local lease="$2"
+  AIRLIFT_REMOTE_AUTH_DIR=""
+  if [ -n "${AIRLIFT_TEST_METRICS_DIR:-}" ]; then
+    [ "${AIRLIFT_TEST_AUTH_MISSING:-0}" != "1" ] || return 1
+    AIRLIFT_REMOTE_AUTH_DIR="$HOME/.airlift/auth/test/$lease"
+    mkdir -p "$AIRLIFT_REMOTE_AUTH_DIR/codex" "$AIRLIFT_REMOTE_AUTH_DIR/claude"
+    case "$agent" in
+      codex) printf '{}\n' >"$AIRLIFT_REMOTE_AUTH_DIR/codex/auth.json" ;;
+      claude) printf 'test-key\n' >"$AIRLIFT_REMOTE_AUTH_DIR/anthropic-key" ;;
+    esac
+    return 0
+  fi
+
+  local remote_home controller_id auth_dir
+  remote_home="$(ssh -o BatchMode=yes "$AIRLIFT_ALIAS" 'printf %s "$HOME"' </dev/null)" || return 1
+  controller_id="$(local_hardware_uuid || printf '%s' "${USER:-controller}-$(hostname)")"
+  controller_id="$(safe_remote_name "$controller_id")"
+  auth_dir="$remote_home/.airlift/auth/$controller_id/$lease"
+  ssh -o BatchMode=yes "$AIRLIFT_ALIAS" \
+    "umask 077; mkdir -p $(shell_quote "$auth_dir/codex") $(shell_quote "$auth_dir/claude"); chmod 700 $(shell_quote "$auth_dir") $(shell_quote "$auth_dir/codex") $(shell_quote "$auth_dir/claude")" \
+    </dev/null >/dev/null || return 1
+
+  case "$agent" in
+    codex)
+      local codex_auth="${CODEX_HOME:-$HOME/.codex}/auth.json"
+      if [ ! -s "$codex_auth" ] ||
+        ! ssh -o BatchMode=yes "$AIRLIFT_ALIAS" \
+          "umask 077; cat > $(shell_quote "$auth_dir/codex/auth.json")" \
+          <"$codex_auth" >/dev/null
+      then
+        cleanup_remote_agent_auth "$auth_dir"
+        return 1
+      fi
+      ;;
+    claude)
+      local claude_credentials="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/.credentials.json"
+      if [ -n "${ANTHROPIC_API_KEY:-}" ]; then
+        if ! printf '%s' "$ANTHROPIC_API_KEY" | ssh -o BatchMode=yes "$AIRLIFT_ALIAS" \
+          "umask 077; cat > $(shell_quote "$auth_dir/anthropic-key")" >/dev/null
+        then
+          cleanup_remote_agent_auth "$auth_dir"
+          return 1
+        fi
+      elif [ -s "$claude_credentials" ]; then
+        if ! ssh -o BatchMode=yes "$AIRLIFT_ALIAS" \
+          "umask 077; cat > $(shell_quote "$auth_dir/claude/.credentials.json")" \
+          <"$claude_credentials" >/dev/null
+        then
+          cleanup_remote_agent_auth "$auth_dir"
+          return 1
+        fi
+      else
+        cleanup_remote_agent_auth "$auth_dir"
+        return 1
+      fi
+      ;;
+  esac
+  AIRLIFT_REMOTE_AUTH_DIR="$auth_dir"
+}
+
+cleanup_remote_agent_auth() {
+  local auth_dir="$1"
+  [ -n "${AIRLIFT_TEST_METRICS_DIR:-}" ] && return 0
+  case "$auth_dir" in
+    */.airlift/auth/*/*) ;;
+    *) return 0 ;;
+  esac
+  ssh -o BatchMode=yes "$AIRLIFT_ALIAS" \
+    "rm -rf -- $(shell_quote "$auth_dir")" </dev/null >/dev/null 2>&1 || true
+}
+
 write_back_worktree() {
   local local_root="$1"
   local remote_root="$2"
@@ -1937,14 +2100,35 @@ hop_agent() {
   local agent="$1"
   local remote_cwd="$2"
   shift 2
-  local quoted_agent quoted_cwd quoted_args="" remote_script remote_command arg
+  local quoted_agent quoted_cwd quoted_auth_dir quoted_args="" remote_script remote_command arg
   quoted_agent="$(shell_quote "$agent")"
   quoted_cwd="$(shell_quote "$remote_cwd")"
+  quoted_auth_dir="$(shell_quote "$AIRLIFT_REMOTE_AUTH_DIR")"
   for arg in "$@"; do
     quoted_args="$quoted_args $(shell_quote "$arg")"
   done
-  remote_script='set -euo pipefail
+remote_script='set -euo pipefail
 export PATH="$HOME/.airlift/runtime/bin:$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$HOME/.codex/bin:$PATH"
+unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN OPENAI_API_KEY CODEX_API_KEY
+unset CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX CLAUDE_CODE_USE_FOUNDRY
+auth_dir="$AIRLIFT_AUTH_DIR"
+[ -d "$auth_dir" ] || { printf "Controller authentication was not staged.\n" >&2; exit 1; }
+case "$AIRLIFT_AGENT" in
+  codex)
+    [ -r "$auth_dir/codex/auth.json" ] || { printf "Controller Codex authentication is unavailable.\n" >&2; exit 1; }
+    export CODEX_HOME="$auth_dir/codex"
+    ;;
+  claude)
+    export CLAUDE_CONFIG_DIR="$auth_dir/claude"
+    if [ -r "$auth_dir/anthropic-key" ]; then
+      ANTHROPIC_API_KEY="$(cat "$auth_dir/anthropic-key")"
+      export ANTHROPIC_API_KEY
+    elif [ ! -r "$auth_dir/claude/.credentials.json" ]; then
+      printf "Controller Claude authentication is unavailable.\n" >&2
+      exit 1
+    fi
+    ;;
+esac
 project="$AIRLIFT_CWD"
 case "$project" in
   "~") project="$HOME" ;;
@@ -1955,7 +2139,12 @@ mkdir -p "$HOME/.airlift/jobs"
 lease="$(mktemp "$HOME/.airlift/jobs/job.XXXXXX")"
 printf "%s\n" "$$" >"$lease"
 printf "agent=%s\ncwd=%s\n" "$AIRLIFT_AGENT" "$project" >>"$lease"
-cleanup() { rm -f "$lease"; }
+cleanup() {
+  rm -f "$lease"
+  case "$auth_dir" in
+    "$HOME/.airlift/auth/"*) rm -rf -- "$auth_dir" ;;
+  esac
+}
 trap cleanup EXIT
 trap "exit 130" INT
 trap "exit 143" HUP TERM
@@ -1966,7 +2155,7 @@ case "$AIRLIFT_AGENT" in
     if [ "${AIRLIFT_ONESHOT:-0}" = "1" ]; then
       codex exec -C "$project" -
     else
-      exec codex "$@"
+      codex "$@"
     fi
     ;;
   claude)
@@ -1974,12 +2163,12 @@ case "$AIRLIFT_AGENT" in
     if [ "${AIRLIFT_ONESHOT:-0}" = "1" ]; then
       claude -p
     else
-      exec claude "$@"
+      claude "$@"
     fi
     ;;
   *) printf "Unknown agent: %s\n" "$AIRLIFT_AGENT" >&2; exit 1 ;;
 esac'
-  remote_command="AIRLIFT_AGENT=$quoted_agent AIRLIFT_CWD=$quoted_cwd AIRLIFT_ONESHOT=$(shell_quote "${AIRLIFT_ONESHOT:-0}") bash -c $(shell_quote "$remote_script") airlift$quoted_args"
+  remote_command="AIRLIFT_AGENT=$quoted_agent AIRLIFT_CWD=$quoted_cwd AIRLIFT_AUTH_DIR=$quoted_auth_dir AIRLIFT_ONESHOT=$(shell_quote "${AIRLIFT_ONESHOT:-0}") bash -c $(shell_quote "$remote_script") airlift$quoted_args"
   if [ -n "${AIRLIFT_SSH_TTY:-}" ]; then
     ssh -t "$AIRLIFT_ALIAS" "$remote_command"
   else
@@ -2022,7 +2211,11 @@ local_cmd_exec() {
   if force_local_requested; then
     run_agent_local "$agent" "$cwd" "$@"
   fi
-  if ! select_node "$worker" "$root" 0; then
+  if ! select_execution_target "$agent" "$worker" "$root"; then
+    run_agent_local "$agent" "$cwd" "$@"
+  fi
+  if [ "${AIRLIFT_EXECUTION_LOCAL:-0}" = "1" ]; then
+    AIRLIFT_LOCAL_REASON="${AIRLIFT_ROUTING_REASON:-auto selected this Mac}"
     run_agent_local "$agent" "$cwd" "$@"
   fi
   load_node "$AIRLIFT_SELECTED_ALIAS"
@@ -2044,10 +2237,22 @@ local_cmd_exec() {
     fi
   fi
   remote_root="$AIRLIFT_REMOTE_PROJECT"
+  if ! stage_remote_agent_auth "$agent" "$lease"; then
+    if [ "$scratch" = "1" ]; then
+      cleanup_scratch_worktree "$remote_root"
+    else
+      release_overlay_lock "$lock_file"
+    fi
+    if [ "$worker" = "auto" ] && [ -n "${AIRLIFT_LOCAL_AGENT_BIN:-}" ]; then
+      AIRLIFT_LOCAL_REASON="remote controller authentication unavailable"
+      run_agent_local "$agent" "$cwd" "$@"
+    fi
+    die "Refusing to use $AIRLIFT_ALIAS's $agent account. Authenticate $agent on this controller or choose local execution."
+  fi
   if [ "$scratch" = "1" ]; then
-    notify_airlift "running on $AIRLIFT_ALIAS ($AIRLIFT_SELECTED_MACHINE); home folder not synced"
+    notify_airlift "${AIRLIFT_ROUTING_REASON:+$AIRLIFT_ROUTING_REASON; }running on $AIRLIFT_ALIAS ($AIRLIFT_SELECTED_MACHINE); home folder not synced"
   else
-    notify_airlift "running on $AIRLIFT_ALIAS ($AIRLIFT_SELECTED_MACHINE)"
+    notify_airlift "${AIRLIFT_ROUTING_REASON:+$AIRLIFT_ROUTING_REASON; }running on $AIRLIFT_ALIAS ($AIRLIFT_SELECTED_MACHINE)"
   fi
   local hop_status=0
   if [ -t 0 ] && [ "$oneshot" != "1" ]; then
@@ -2056,6 +2261,7 @@ local_cmd_exec() {
     AIRLIFT_SSH_TTY=""
   fi
   hop_agent "$agent" "$AIRLIFT_REMOTE_CWD" "$@" || hop_status=$?
+  cleanup_remote_agent_auth "$AIRLIFT_REMOTE_AUTH_DIR"
   if [ "$scratch" = "1" ]; then
     cleanup_scratch_worktree "$remote_root"
   else

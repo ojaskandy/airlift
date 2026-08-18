@@ -7,6 +7,7 @@ TEMP_HOME="$(mktemp -d)"
 METRICS_DIR="$TEMP_HOME/metrics"
 OPEN_LOG="$TEMP_HOME/open.log"
 SSH_LOG="$TEMP_HOME/ssh.log"
+LOCAL_METRICS_FILE="$METRICS_DIR/this-mac"
 
 cleanup() {
   if [ -n "${DASH_PID:-}" ]; then
@@ -31,6 +32,7 @@ airlift_test() {
   AIRLIFT_TEST_OPEN_LOG="$OPEN_LOG" \
   AIRLIFT_TEST_SSH_LOG="$SSH_LOG" \
   AIRLIFT_TEST_METRICS_DIR="$METRICS_DIR" \
+  AIRLIFT_TEST_LOCAL_METRICS_FILE="$LOCAL_METRICS_FILE" \
   AIRLIFT_TEST_SELF_UUID="controller-uuid" \
   "$ROOT/airlift" "$@"
 }
@@ -53,7 +55,7 @@ printf '%s\n' "$WORKER_ONE_COMMAND_DRY_RUN" | grep -F "systemsetup -setremotelog
 WORKER_WRAPPER_DRY_RUN="$("$ROOT/install.sh" --worker --dry-run)"
 printf '%s\n' "$WORKER_WRAPPER_DRY_RUN" | grep -F "systemsetup -setremotelogin on" >/dev/null
 
-"$ROOT/airlift" --version | grep -F "airlift 0.4.3"
+"$ROOT/airlift" --version | grep -F "airlift 0.4.4"
 "$ROOT/airlift" --help | grep -F "Airlift"
 "$ROOT/airlift" --help | grep -F "dashboard"
 "$ROOT/airlift" --help | grep -F "forget"
@@ -75,6 +77,7 @@ printf '%s\n' "$UNPAIRED_NODES" | grep -F "this-mac" >/dev/null
 printf '%s\n' "$UNPAIRED_NODES" | grep -F "local" >/dev/null
 
 mkdir -p "$METRICS_DIR" "$TEMP_HOME/.local/bin"
+printf '8\t2\t8.0\t8\t1\t0\tTest Controller\t8589934592\t17179869184\t70\tNominal\t10\t100\t200\t1000\tApple Test 8c\t21474836480\t107374182400\t100\tAC Power\t\n' >"$LOCAL_METRICS_FILE"
 airlift_test setup worker@air.local --install none --no-awake >/dev/null 2>&1
 ln -sf "$ROOT/tests/fakes/codex" "$TEMP_HOME/.local/bin/codex"
 ln -sf "$ROOT/tests/fakes/claude" "$TEMP_HOME/.local/bin/claude"
@@ -118,6 +121,8 @@ assert "this-mac" in ids
 assert "spare-air" in ids
 assert "beefy" in ids
 spare = next(machine for machine in data["machines"] if machine["alias"] == "spare-air")
+controller = next(machine for machine in data["machines"] if machine["alias"] == "this-mac")
+assert float(controller["score"]) > 0
 assert spare["mem_total"] == 17179869184
 assert spare["cpu_temp_c"] == 68
 assert spare["thermal_pressure"] == "Nominal"
@@ -127,7 +132,7 @@ assert spare["gpu_name"] == "Apple M2 10c"
 assert spare["disk_total"] == 107374182400
 assert spare["battery_pct"] == 100
 assert spare["tasks"][0]["agent"] == "claude"
-assert data["version"] == "0.4.3"
+assert data["version"] == "0.4.4"
 '
 
 printf '0\t8\t0.2\t24\t1\t0\tBeefy Mac\t4294967296\t34359738368\t-\t-\t-\t80\t180\t900\tApple M3 Max 40c\t32212254720\t214748364800\t91\tAC Power\t\n' >"$METRICS_DIR/beefy"
@@ -186,9 +191,46 @@ grep -F -- "-fN -M" "$SSH_LOG" | grep -F "beefy" >/dev/null
 
 RUN_OUTPUT="$(airlift_test run --project "~/Developer/Dylan's test project" "fix the test")"
 printf '%s\n' "$RUN_OUTPUT" | grep -F "codex[$TEMP_HOME/Developer/Dylan's test project]: fix the test" >/dev/null
+grep -F "AIRLIFT_AUTH_DIR=" "$SSH_LOG" | grep -F "AIRLIFT_AGENT='codex'" >/dev/null
 
 CLAUDE_OUTPUT="$(airlift_test run --agent claude --worker spare-air --project "~/Developer/Dylan's test project" "review this")"
 printf '%s\n' "$CLAUDE_OUTPUT" | grep -F "claude[$TEMP_HOME/Developer/Dylan's test project]: review this" >/dev/null
+
+# Automatic routing includes the controller and keeps work local when its score wins.
+printf '0\t4\t0\t8\t1\t0\tIdle Controller\t4294967296\t17179869184\t45\tNominal\t2\t80\t180\t900\tApple Test 8c\t21474836480\t107374182400\t100\tAC Power\t\n' >"$LOCAL_METRICS_FILE"
+: >"$SSH_LOG"
+LOCAL_AUTO="$(airlift_test run --project "~/Developer/Dylan's test project" "use this Mac")"
+printf '%s\n' "$LOCAL_AUTO" | grep -F "codex[$TEMP_HOME/Developer/Dylan's test project]: use this Mac" >/dev/null
+if grep -F "AIRLIFT_AGENT=" "$SSH_LOG" >/dev/null; then
+  printf 'auto routing ignored the lower-scored controller\n' >&2
+  exit 1
+fi
+
+# A remote score may win only with controller-owned authentication staged.
+printf '8\t2\t8.0\t8\t1\t0\tBusy Controller\t8589934592\t17179869184\t70\tNominal\t10\t100\t200\t1000\tApple Test 8c\t21474836480\t107374182400\t100\tAC Power\t\n' >"$LOCAL_METRICS_FILE"
+: >"$SSH_LOG"
+AUTH_FALLBACK="$(AIRLIFT_TEST_AUTH_MISSING=1 airlift_test run --project "~/Developer/Dylan's test project" "keep my account local")"
+printf '%s\n' "$AUTH_FALLBACK" | grep -F "codex[$TEMP_HOME/Developer/Dylan's test project]: keep my account local" >/dev/null
+if grep -F "AIRLIFT_AGENT=" "$SSH_LOG" >/dev/null; then
+  printf 'auto routing used worker authentication after staging failed\n' >&2
+  exit 1
+fi
+EXPLICIT_AUTH_ERROR="$TEMP_HOME/explicit-auth.stderr"
+if AIRLIFT_TEST_AUTH_MISSING=1 airlift_test run --worker beefy --project "~/Developer/Dylan's test project" "do not borrow auth" \
+  >/dev/null 2>"$EXPLICIT_AUTH_ERROR"
+then
+  printf 'explicit worker routing used worker authentication after staging failed\n' >&2
+  exit 1
+fi
+grep -F "Refusing to use beefy's codex account" "$EXPLICIT_AUTH_ERROR" >/dev/null
+if grep -F "test-key" "$SSH_LOG" >/dev/null; then
+  printf 'controller credential leaked into SSH command arguments\n' >&2
+  exit 1
+fi
+if [ -d "$TEMP_HOME/.airlift/auth" ] && find "$TEMP_HOME/.airlift/auth" -type f -print -quit | grep . >/dev/null; then
+  printf 'per-job controller authentication was not cleaned up\n' >&2
+  exit 1
+fi
 
 printf '0\t8\t0.2\t24\t1\t0\tHot Studio\t33285996544\t34359738368\t96\tSerious\t95\t12000\t1200\t18000\tApple M3 Max 40c\t32212254720\t214748364800\t91\tAC Power\t\n' >"$METRICS_DIR/beefy"
 printf '0\t2\t0.2\t8\t1\t0\tCool Spare\t4294967296\t17179869184\t54\tNominal\t4\t100\t200\t1100\tApple M2 10c\t21474836480\t107374182400\t100\tAC Power\t\n' >"$METRICS_DIR/spare-air"
@@ -266,5 +308,13 @@ grep -F "AIRLIFT_REAL_CODEX='$ROOT/tests/fakes/codex'" "$TEMP_HOME/.config/airli
 HOME="$TEMP_HOME" PATH="$INSTALL_PATH" "$ROOT/install.sh" >/dev/null
 grep -F "AIRLIFT_REAL_CLAUDE='$ROOT/tests/fakes/claude'" "$TEMP_HOME/.config/airlift/real-binaries" >/dev/null
 grep -F "AIRLIFT_REAL_CODEX='$ROOT/tests/fakes/codex'" "$TEMP_HOME/.config/airlift/real-binaries" >/dev/null
+
+# A controller can reuse its own Conductor-managed agent binary without using a worker's login.
+DISCOVERY_HOME="$TEMP_HOME/conductor-discovery"
+DISCOVERY_CLAUDE="$DISCOVERY_HOME/Library/Application Support/com.conductor.app/agent-binaries/claude/2.1.201/claude"
+mkdir -p "$(dirname "$DISCOVERY_CLAUDE")"
+cp "$ROOT/tests/fakes/claude" "$DISCOVERY_CLAUDE"
+HOME="$DISCOVERY_HOME" PATH="/usr/bin:/bin" "$ROOT/install.sh" >/dev/null
+grep -F "AIRLIFT_REAL_CLAUDE='$DISCOVERY_CLAUDE'" "$DISCOVERY_HOME/.config/airlift/real-binaries" >/dev/null
 
 printf 'smoke tests passed\n'

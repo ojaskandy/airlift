@@ -84,10 +84,17 @@ the user running the installer when necessary. Review that later under
 ## Route a task
 
 `claude` and `codex` on the controller copy the current git worktree to the
-chosen Mac, run there, and copy edits back. You do not have to pre-clone the
-repo onto every worker for that hop. Start the agent from the project directory.
+chosen Mac only when that Mac scores better than the controller, run there, and
+copy edits back. The controller itself is part of automatic selection. You do
+not have to pre-clone the repo onto every worker for that hop. Start the agent
+from the project directory.
 Launches from your home directory use an empty temporary worker folder, so
 Airlift never copies the entire home folder to another Mac.
+
+Remote jobs never inherit the worker owner's Claude or Codex login. Airlift
+stages the controller's authentication in a private per-job directory and
+removes it when the job exits. If controller authentication cannot be staged,
+automatic routing stays local and an explicitly pinned remote job is refused.
 
 `airlift run` is the explicit one-shot path. To pin a shared checkout on every
 worker instead of copying per job:

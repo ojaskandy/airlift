@@ -154,6 +154,16 @@ find_real_agent() {
     fi
   done
   IFS="$old_ifs"
+
+  local conductor_dir
+  conductor_dir="$HOME/Library/Application Support/com.conductor.app/agent-binaries/$agent"
+  if [ -d "$conductor_dir" ]; then
+    candidate="$(find "$conductor_dir" -type f -name "$agent" -perm -111 -print 2>/dev/null | sort -V | tail -n 1)"
+    if [ -n "$candidate" ] && [ -x "$candidate" ]; then
+      printf '%s' "$candidate"
+      return 0
+    fi
+  fi
   return 1
 }
 
