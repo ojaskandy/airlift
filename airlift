@@ -559,7 +559,12 @@ join_cmd() {
 
   if ! ssh -o BatchMode=yes -o ConnectTimeout=6 "$alias" true >/dev/null 2>&1; then
     warn "One Mac password prompt may appear to authorize this controller's SSH key."
-    if ! ssh-copy-id -i "$KEY_FILE.pub" -o StrictHostKeyChecking=accept-new "$target"; then
+    if ! ssh-copy-id -i "$KEY_FILE.pub" \
+      -o StrictHostKeyChecking=accept-new \
+      -o IdentitiesOnly=yes \
+      -o IdentityFile="$KEY_FILE" \
+      "$target"
+    then
       say ""
       warn "Could not reach the worker."
       say "On that Mac, enable: System Settings → General → Sharing → Remote Login"
