@@ -129,6 +129,24 @@ assert spare["tasks"][0]["agent"] == "claude"
 assert data["version"] == "0.4.2"
 '
 
+printf '0\t8\t0.2\t24\t1\t0\tBeefy Mac\t4294967296\t34359738368\t-\t-\t-\t80\t180\t900\tApple M3 Max 40c\t32212254720\t214748364800\t91\tAC Power\t\n' >"$METRICS_DIR/beefy"
+POOL_JSON_WITH_MISSING_SENSORS="$(airlift_test nodes --json)"
+printf '%s\n' "$POOL_JSON_WITH_MISSING_SENSORS" | python3 -c '
+import json, sys
+data = json.load(sys.stdin)
+beefy = next(machine for machine in data["machines"] if machine["alias"] == "beefy")
+assert beefy["cpu_temp_c"] is None
+assert beefy["thermal_pressure"] == ""
+assert beefy["gpu_active_pct"] is None
+assert beefy["gpu_power_mw"] == 80
+assert beefy["gpu_freq_mhz"] == 180
+assert beefy["cpu_power_mw"] == 900
+assert beefy["gpu_name"] == "Apple M3 Max 40c"
+assert beefy["disk_total"] == 214748364800
+assert beefy["battery_pct"] == 91
+assert beefy["power_source"] == "AC Power"
+'
+
 DASH_PORT="$((34000 + ($$ % 1000)))"
 airlift_test dashboard --port "$DASH_PORT" --no-open >/dev/null 2>&1 &
 DASH_PID="$!"

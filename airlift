@@ -659,6 +659,27 @@ clean_float() {
   case "$value" in ""|*[!0-9.]*) return 0 ;; *) printf '%s' "$value" ;; esac
 }
 
+clean_temp_c() {
+  value="$(clean_float "$1")"
+  [ -n "$value" ] || return 0
+  awk -v value="$value" 'BEGIN { if (value > 0 && value < 130) printf "%s", value }'
+}
+
+clean_percent() {
+  value="$(clean_float "$1")"
+  [ -n "$value" ] || return 0
+  awk -v value="$value" 'BEGIN { if (value >= 0 && value <= 100) printf "%s", value }'
+}
+
+clean_thermal_pressure() {
+  value="$(printf '%s' "${1:-}" | tr '\t\n' '  ')"
+  lower="$(printf '%s' "$value" | tr '[:upper:]' '[:lower:]')"
+  case "$lower" in
+    ""|*"****"*|*"thermal pressure"*) return 0 ;;
+    *nominal*|*normal*|*ok*|*fair*|*moderate*|*serious*|*heavy*|*critical*) printf '%s' "$value" ;;
+  esac
+}
+
 jobs=0
 if [ -d "$HOME/.airlift/jobs" ]; then
   for lease in "$HOME/.airlift/jobs"/job.*; do
@@ -741,12 +762,12 @@ gpu_power_mw="${AIRLIFT_TEST_GPU_POWER_MW:-$(cache_value gpu_power_mw)}"
 gpu_freq_mhz="${AIRLIFT_TEST_GPU_FREQ_MHZ:-$(cache_value gpu_freq_mhz)}"
 cpu_power_mw="${AIRLIFT_TEST_CPU_POWER_MW:-$(cache_value cpu_power_mw)}"
 
-cpu_temp_c="$(clean_float "$cpu_temp_c")"
-gpu_active_pct="$(clean_float "$gpu_active_pct")"
+cpu_temp_c="$(clean_temp_c "$cpu_temp_c")"
+gpu_active_pct="$(clean_percent "$gpu_active_pct")"
 gpu_power_mw="$(clean_float "$gpu_power_mw")"
 gpu_freq_mhz="$(clean_float "$gpu_freq_mhz")"
 cpu_power_mw="$(clean_float "$cpu_power_mw")"
-thermal_pressure="$(printf '%s' "${thermal_pressure:-}" | tr '\t\n' '  ')"
+thermal_pressure="$(clean_thermal_pressure "$thermal_pressure")"
 
 gpu_name="$(
   /usr/sbin/system_profiler SPDisplaysDataType 2>/dev/null |
@@ -867,9 +888,9 @@ probe_node() {
   )"
   printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
     "$AIRLIFT_ALIAS" "$score" "$busy" "$slots" "$load" "$cores" "$ready" "$machine" "$AIRLIFT_TRANSPORT" "$AIRLIFT_TARGET" \
-    "$mem_used" "$mem_total" "${cpu_temp_c:-}" "${thermal_pressure:-}" "${gpu_active_pct:-}" "${gpu_power_mw:-}" \
-    "${gpu_freq_mhz:-}" "${cpu_power_mw:-}" "${gpu_name:-}" "${disk_used:-0}" "${disk_total:-0}" \
-    "${battery_pct:-0}" "${power_source:-}" "${tasks:-}"
+    "$mem_used" "$mem_total" "${cpu_temp_c:-"-"}" "${thermal_pressure:-"-"}" "${gpu_active_pct:-"-"}" "${gpu_power_mw:-"-"}" \
+    "${gpu_freq_mhz:-"-"}" "${cpu_power_mw:-"-"}" "${gpu_name:-"-"}" "${disk_used:-0}" "${disk_total:-0}" \
+    "${battery_pct:-0}" "${power_source:-"-"}" "${tasks:-}"
 }
 
 probe_pool() {
@@ -1088,8 +1109,8 @@ emit() {
 }
 
 cpu_temp_c="$(first_number_matching 'cpu.*temperature|temperature.*cpu|die.*temperature|package.*temperature')"
-thermal_pressure="$(first_text_matching 'thermal pressure|thermal level')"
-gpu_active_pct="$(first_number_matching 'gpu.*active.*residency|gpu.*residency|gpu.*active')"
+thermal_pressure="$(first_text_matching 'pressure level|thermal level')"
+gpu_active_pct="$(first_number_matching 'gpu.*active.*residency|gpu.*residency')"
 gpu_power_mw="$(first_number_matching 'gpu.*power')"
 gpu_freq_mhz="$(first_number_matching 'gpu.*frequency')"
 cpu_power_mw="$(first_number_matching 'cpu.*power')"
