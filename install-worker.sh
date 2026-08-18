@@ -156,6 +156,16 @@ enable_remote_login() {
   fi
 }
 
+install_metrics_sampler() {
+  if airlift metrics install; then
+    say "✓ Temperature and GPU metrics are enabled."
+  else
+    say "!"
+    say "Airlift is installed, but the temperature/GPU sampler did not install."
+    say "You can retry later with: airlift metrics install"
+  fi
+}
+
 print_join_command() {
   local user="$1"
   local host alias
@@ -191,6 +201,9 @@ Would install the CLI at:
 Would request administrator approval and run Apple's supported command:
   sudo /usr/sbin/systemsetup -setremotelogin on
 
+Would install the Airlift CPU temperature/GPU sampler:
+  airlift metrics install
+
 Would preserve the existing Remote Login ACL and ensure this user is allowed:
   $user
 EOF
@@ -200,6 +213,7 @@ EOF
   [ "$(uname -s)" = "Darwin" ] || die "Airlift worker setup requires macOS."
   install_cli
   enable_remote_login "$user"
+  install_metrics_sampler
   print_join_command "$user"
 }
 

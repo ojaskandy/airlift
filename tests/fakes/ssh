@@ -7,6 +7,19 @@ if [ -n "${AIRLIFT_TEST_SSH_LOG:-}" ]; then
 fi
 
 last="${!#}"
+if [[ "$last" == *"IOPlatformUUID"* ]]; then
+  host="unknown"
+  previous=""
+  for arg in "$@"; do
+    if [ "$arg" = "$last" ]; then
+      host="$previous"
+      break
+    fi
+    previous="$arg"
+  done
+  printf 'uuid-%s\n' "$host"
+  exit 0
+fi
 if [ "$last" = "airlift-uuid" ]; then
   host="unknown"
   prev=""

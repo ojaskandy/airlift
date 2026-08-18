@@ -93,6 +93,7 @@ else
   fi
 fi
 printf 'Pool board: airlift dashboard\n'
+printf 'For local CPU temperature and GPU stats, run once: airlift metrics install\n'
 
 install_shim() {
   local agent="$1"

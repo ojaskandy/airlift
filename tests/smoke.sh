@@ -53,7 +53,7 @@ printf '%s\n' "$WORKER_ONE_COMMAND_DRY_RUN" | grep -F "systemsetup -setremotelog
 WORKER_WRAPPER_DRY_RUN="$("$ROOT/install.sh" --worker --dry-run)"
 printf '%s\n' "$WORKER_WRAPPER_DRY_RUN" | grep -F "systemsetup -setremotelogin on" >/dev/null
 
-"$ROOT/airlift" --version | grep -F "airlift 0.4.1"
+"$ROOT/airlift" --version | grep -F "airlift 0.4.2"
 "$ROOT/airlift" --help | grep -F "Airlift"
 "$ROOT/airlift" --help | grep -F "dashboard"
 [ -f "$ROOT/dashboard.html" ]
@@ -63,6 +63,15 @@ source "$ROOT/airlift"
 [ "$(shell_quote "plain")" = "'plain'" ]
 [ "$(shell_quote "it's safe")" = "'it'\\''s safe'" ]
 [ "$(awk -v busy=2 -v slots=4 -v load_value=1 -v cores=8 'BEGIN { printf "%.1f", (busy / slots) * 1000 + (load_value / cores) * 100 }')" = "512.5" ]
+if rsync_common_excludes | grep -F -- "--exclude=.git" >/dev/null; then
+  printf 'push sync should keep .git available on the worker\n' >&2
+  exit 1
+fi
+rsync_pull_excludes | grep -F -- "--exclude=.git" >/dev/null
+
+UNPAIRED_NODES="$(airlift_test nodes)"
+printf '%s\n' "$UNPAIRED_NODES" | grep -F "this-mac" >/dev/null
+printf '%s\n' "$UNPAIRED_NODES" | grep -F "local" >/dev/null
 
 mkdir -p "$METRICS_DIR" "$TEMP_HOME/.local/bin"
 airlift_test setup worker@air.local --install none --no-awake >/dev/null 2>&1
@@ -86,8 +95,8 @@ grep -F "AIRLIFT_SLOTS='8'" "$TEMP_HOME/.config/airlift/nodes/beefy" >/dev/null
 grep -F "AIRLIFT_TRANSPORT='tailscale'" "$TEMP_HOME/.config/airlift/nodes/beefy" >/dev/null
 
 mkdir -p "$TEMP_HOME/Developer/Dylan's test project"
-printf '2\t2\t0.4\t8\t1\t2\tSpare Air\t8589934592\t17179869184\tclaude|1001|512000|claude -p fix\n' >"$METRICS_DIR/spare-air"
-printf '0\t8\t0.2\t24\t1\t0\tBeefy Mac\t4294967296\t34359738368\t\n' >"$METRICS_DIR/beefy"
+printf '2\t2\t0.4\t8\t1\t2\tSpare Air\t8589934592\t17179869184\t68\tNominal\t12\t450\t300\t2800\tApple M2 10c\t21474836480\t107374182400\t100\tAC Power\tclaude|1001|512000|claude -p fix\n' >"$METRICS_DIR/spare-air"
+printf '0\t8\t0.2\t24\t1\t0\tBeefy Mac\t4294967296\t34359738368\t45\tNominal\t2\t80\t180\t900\tApple M3 Max 40c\t32212254720\t214748364800\t91\tAC Power\t\n' >"$METRICS_DIR/beefy"
 
 POOL_OUTPUT="$(airlift_test nodes)"
 printf '%s\n' "$POOL_OUTPUT" | grep -F "spare-air" >/dev/null
@@ -95,6 +104,9 @@ printf '%s\n' "$POOL_OUTPUT" | grep -F "beefy" >/dev/null
 printf '%s\n' "$POOL_OUTPUT" | grep -F "0/8" >/dev/null
 printf '%s\n' "$POOL_OUTPUT" | grep -F "tailscale" >/dev/null
 printf '%s\n' "$POOL_OUTPUT" | grep -F "8.0/16G" >/dev/null
+printf '%s\n' "$POOL_OUTPUT" | grep -F "68C" >/dev/null
+printf '%s\n' "$POOL_OUTPUT" | grep -F "12%/0.5W" >/dev/null
+printf '%s\n' "$POOL_OUTPUT" | grep -F "20.0/100G" >/dev/null
 
 POOL_JSON="$(airlift_test nodes --json)"
 printf '%s\n' "$POOL_JSON" | python3 -c '
@@ -106,8 +118,15 @@ assert "spare-air" in ids
 assert "beefy" in ids
 spare = next(machine for machine in data["machines"] if machine["alias"] == "spare-air")
 assert spare["mem_total"] == 17179869184
+assert spare["cpu_temp_c"] == 68
+assert spare["thermal_pressure"] == "Nominal"
+assert spare["gpu_active_pct"] == 12
+assert spare["gpu_power_mw"] == 450
+assert spare["gpu_name"] == "Apple M2 10c"
+assert spare["disk_total"] == 107374182400
+assert spare["battery_pct"] == 100
 assert spare["tasks"][0]["agent"] == "claude"
-assert data["version"] == "0.4.1"
+assert data["version"] == "0.4.2"
 '
 
 DASH_PORT="$((34000 + ($$ % 1000)))"
@@ -123,6 +142,8 @@ for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
 done
 [ "$ready" = "1" ]
 curl -fsS "http://127.0.0.1:$DASH_PORT/" | grep -F "House pool" >/dev/null
+curl -fsS "http://127.0.0.1:$DASH_PORT/" | grep -F "Add a Mac" >/dev/null
+curl -fsS "http://127.0.0.1:$DASH_PORT/" | grep -F "./install-worker.sh" >/dev/null
 curl -fsS "http://127.0.0.1:$DASH_PORT/api/pool" | python3 -c '
 import json, sys
 data = json.load(sys.stdin)
@@ -150,8 +171,14 @@ printf '%s\n' "$RUN_OUTPUT" | grep -F "codex[$TEMP_HOME/Developer/Dylan's test p
 CLAUDE_OUTPUT="$(airlift_test run --agent claude --worker spare-air --project "~/Developer/Dylan's test project" "review this")"
 printf '%s\n' "$CLAUDE_OUTPUT" | grep -F "claude[$TEMP_HOME/Developer/Dylan's test project]: review this" >/dev/null
 
+printf '0\t8\t0.2\t24\t1\t0\tHot Studio\t33285996544\t34359738368\t96\tSerious\t95\t12000\t1200\t18000\tApple M3 Max 40c\t32212254720\t214748364800\t91\tAC Power\t\n' >"$METRICS_DIR/beefy"
+printf '0\t2\t0.2\t8\t1\t0\tCool Spare\t4294967296\t17179869184\t54\tNominal\t4\t100\t200\t1100\tApple M2 10c\t21474836480\t107374182400\t100\tAC Power\t\n' >"$METRICS_DIR/spare-air"
+: >"$SSH_LOG"
+airlift_test run --project "~/Developer/Dylan's test project" "avoid hot worker" >/dev/null
+grep -F "spare-air AIRLIFT_AGENT=" "$SSH_LOG" >/dev/null
+
 # Missing checkout is no longer fatal for run/exec: least-used worker still wins.
-printf '0\t8\t0.2\t24\t0\t0\tBeefy Mac\n' >"$METRICS_DIR/beefy"
+printf '0\t8\t0.2\t24\t0\t0\tBeefy Mac\t4294967296\t34359738368\t45\tNominal\t2\t80\t180\t900\tApple M3 Max 40c\t32212254720\t214748364800\t91\tAC Power\t\n' >"$METRICS_DIR/beefy"
 : >"$SSH_LOG"
 airlift_test run --project "~/Developer/Dylan's test project" "route onto empty worker" >/dev/null
 grep -F "beefy AIRLIFT_AGENT=" "$SSH_LOG" >/dev/null

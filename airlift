@@ -2,7 +2,7 @@
 
 set -euo pipefail
 
-VERSION="0.4.1"
+VERSION="0.4.2"
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/airlift"
 CONFIG_FILE="$CONFIG_DIR/config"
 NODES_DIR="$CONFIG_DIR/nodes"
@@ -72,6 +72,7 @@ Usage:
   airlift shell [worker]
   airlift awake [--worker name]
   airlift sleep [--worker name]
+  airlift metrics status|install                 Install/check CPU temp and GPU sampler
   airlift stop                                   Close the active private tunnel
   airlift shutdown [--worker name]               Stop one worker's cockpit
   airlift doctor [--worker name]
@@ -633,19 +634,26 @@ join_cmd() {
   say "  ${BOLD}./airlift open '~/Developer/your-project'${RESET}"
 }
 
-probe_node() {
-  local alias="$1"
-  local project="${2:-~}"
-  load_node "$alias"
-
-  local quoted_project quoted_slots metrics metrics_file
-  quoted_project="$(shell_quote "$project")"
-  quoted_slots="$(shell_quote "$AIRLIFT_SLOTS")"
-  metrics_file="$(mktemp "$CONFIG_DIR/metrics.XXXXXX")"
-  if ! ssh -o BatchMode=yes -o ConnectTimeout=5 "$AIRLIFT_ALIAS" \
-    "AIRLIFT_METRICS=1 AIRLIFT_PROJECT=$quoted_project AIRLIFT_SLOTS=$quoted_slots bash -s" \
-    >"$metrics_file" <<'REMOTE'
+metrics_script() {
+  cat <<'REMOTE'
 set -u
+
+cache_value() {
+  key="$1"
+  [ -r "$thermal_cache" ] || return 0
+  awk -F '\t' -v key="$key" '$1 == key { print $2; exit }' "$thermal_cache" 2>/dev/null
+}
+
+clean_int() {
+  value="$1"
+  case "$value" in ""|*[!0-9]*) printf '0' ;; *) printf '%s' "$value" ;; esac
+}
+
+clean_float() {
+  value="$1"
+  case "$value" in ""|*[!0-9.]*) return 0 ;; *) printf '%s' "$value" ;; esac
+}
+
 jobs=0
 if [ -d "$HOME/.airlift/jobs" ]; then
   for lease in "$HOME/.airlift/jobs"/job.*; do
@@ -660,7 +668,7 @@ if [ -d "$HOME/.airlift/jobs" ]; then
 fi
 
 cores="$(sysctl -n hw.logicalcpu 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || printf 1)"
-case "$cores" in ""|*[!0-9]*) cores=1 ;; esac
+cores="$(clean_int "$cores")"
 [ "$cores" -ge 1 ] || cores=1
 
 if load_raw="$(sysctl -n vm.loadavg 2>/dev/null)"; then
@@ -670,7 +678,8 @@ elif [ -r /proc/loadavg ]; then
 else
   load=0
 fi
-case "$load" in ""|*[!0-9.]*) load=0 ;; esac
+load="$(clean_float "$load")"
+[ -n "$load" ] || load=0
 
 agents="$(
   ps -axo command= 2>/dev/null |
@@ -680,17 +689,19 @@ agents="$(
       END { print count + 0 }
     '
 )"
+agents="$(clean_int "$agents")"
 busy="$jobs"
 [ "$agents" -le "$busy" ] || busy="$agents"
 
-if [ "$AIRLIFT_SLOTS" = "auto" ]; then
+if [ "${AIRLIFT_SLOTS:-auto}" = "auto" ]; then
   slots=$(((cores + 3) / 4))
   [ "$slots" -ge 1 ] || slots=1
 else
-  slots="$AIRLIFT_SLOTS"
+  slots="$(clean_int "$AIRLIFT_SLOTS")"
+  [ "$slots" -ge 1 ] || slots=1
 fi
 
-project="$AIRLIFT_PROJECT"
+project="${AIRLIFT_PROJECT:-~}"
 case "$project" in
   "~") project="$HOME" ;;
   "~/"*) project="$HOME/${project#\~/}" ;;
@@ -711,11 +722,63 @@ mem_used="$(
     END { print (a+w+c)*page + 0 }
   '
 )"
-case "$mem_used" in ""|*[!0-9]*) mem_used=0 ;; esac
-case "$mem_total" in ""|*[!0-9]*) mem_total=0 ;; esac
+mem_used="$(clean_int "$mem_used")"
+mem_total="$(clean_int "$mem_total")"
 if [ "$mem_total" -gt 0 ] && [ "$mem_used" -gt "$mem_total" ]; then
   mem_used="$mem_total"
 fi
+
+thermal_cache="${AIRLIFT_METRICS_CACHE:-$HOME/.airlift/metrics/latest.tsv}"
+cpu_temp_c="${AIRLIFT_TEST_CPU_TEMP_C:-$(cache_value cpu_temp_c)}"
+thermal_pressure="${AIRLIFT_TEST_THERMAL_PRESSURE:-$(cache_value thermal_pressure)}"
+gpu_active_pct="${AIRLIFT_TEST_GPU_ACTIVE_PCT:-$(cache_value gpu_active_pct)}"
+gpu_power_mw="${AIRLIFT_TEST_GPU_POWER_MW:-$(cache_value gpu_power_mw)}"
+gpu_freq_mhz="${AIRLIFT_TEST_GPU_FREQ_MHZ:-$(cache_value gpu_freq_mhz)}"
+cpu_power_mw="${AIRLIFT_TEST_CPU_POWER_MW:-$(cache_value cpu_power_mw)}"
+
+cpu_temp_c="$(clean_float "$cpu_temp_c")"
+gpu_active_pct="$(clean_float "$gpu_active_pct")"
+gpu_power_mw="$(clean_float "$gpu_power_mw")"
+gpu_freq_mhz="$(clean_float "$gpu_freq_mhz")"
+cpu_power_mw="$(clean_float "$cpu_power_mw")"
+thermal_pressure="$(printf '%s' "${thermal_pressure:-}" | tr '\t\n' '  ')"
+
+gpu_name="$(
+  /usr/sbin/system_profiler SPDisplaysDataType 2>/dev/null |
+    awk -F ': ' '
+      /Chipset Model:/ && model == "" { model=$2 }
+      /Total Number of Cores:/ && cores == "" { cores=$2 }
+      END {
+        if (model != "" && cores != "") print model " " cores "c"
+        else if (model != "") print model
+      }
+    '
+)"
+gpu_name="$(printf '%s' "${AIRLIFT_TEST_GPU_NAME:-$gpu_name}" | tr '\t\n' '  ')"
+
+disk_used=0
+disk_total=0
+if disk_line="$(df -k "$project" 2>/dev/null | awk 'NR == 2 { printf "%d\t%d", ($2 - $4) * 1024, $2 * 1024 }')"; then
+  IFS='	' read -r disk_used disk_total <<EOF
+$disk_line
+EOF
+fi
+disk_used="$(clean_int "$disk_used")"
+disk_total="$(clean_int "$disk_total")"
+
+power_source="$(pmset -g batt 2>/dev/null | awk -F "'" '/Now drawing from/ { print $2; exit }')"
+battery_pct="$(pmset -g batt 2>/dev/null | awk -F '[\t%;]' '/InternalBattery|Battery/ { gsub(/[^0-9]/, "", $2); print $2; exit }')"
+battery_pct="$(clean_int "$battery_pct")"
+power_source="$(printf '%s' "${AIRLIFT_TEST_POWER_SOURCE:-${power_source:-}}" | tr '\t\n' '  ')"
+
+[ -n "$cpu_temp_c" ] || cpu_temp_c="-"
+[ -n "$thermal_pressure" ] || thermal_pressure="-"
+[ -n "$gpu_active_pct" ] || gpu_active_pct="-"
+[ -n "$gpu_power_mw" ] || gpu_power_mw="-"
+[ -n "$gpu_freq_mhz" ] || gpu_freq_mhz="-"
+[ -n "$cpu_power_mw" ] || cpu_power_mw="-"
+[ -n "$gpu_name" ] || gpu_name="-"
+[ -n "$power_source" ] || power_source="-"
 
 tasks="$(
   ps -axo pid=,rss=,command= 2>/dev/null | awk '
@@ -737,8 +800,25 @@ tasks="$(
     }
   '
 )"
-printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$busy" "$slots" "$load" "$cores" "$ready" "$jobs" "$machine" "$mem_used" "$mem_total" "$tasks"
+printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+  "$busy" "$slots" "$load" "$cores" "$ready" "$jobs" "$machine" "$mem_used" "$mem_total" \
+  "$cpu_temp_c" "$thermal_pressure" "$gpu_active_pct" "$gpu_power_mw" "$gpu_freq_mhz" "$cpu_power_mw" \
+  "$gpu_name" "$disk_used" "$disk_total" "$battery_pct" "$power_source" "$tasks"
 REMOTE
+}
+
+probe_node() {
+  local alias="$1"
+  local project="${2:-~}"
+  load_node "$alias"
+
+  local quoted_project quoted_slots metrics metrics_file
+  quoted_project="$(shell_quote "$project")"
+  quoted_slots="$(shell_quote "$AIRLIFT_SLOTS")"
+  metrics_file="$(mktemp "$CONFIG_DIR/metrics.XXXXXX")"
+  if ! metrics_script | ssh -o BatchMode=yes -o ConnectTimeout=5 "$AIRLIFT_ALIAS" \
+    "AIRLIFT_METRICS=1 AIRLIFT_PROJECT=$quoted_project AIRLIFT_SLOTS=$quoted_slots bash -s" \
+    >"$metrics_file"
   then
     rm -f "$metrics_file"
     return 1
@@ -746,18 +826,45 @@ REMOTE
   metrics="$(cat "$metrics_file")"
   rm -f "$metrics_file"
 
-  local busy slots load cores ready jobs machine mem_used mem_total tasks score
-  IFS=$'\t' read -r busy slots load cores ready jobs machine mem_used mem_total tasks <<<"$metrics"
+  local busy slots load cores ready jobs machine mem_used mem_total cpu_temp_c thermal_pressure
+  local gpu_active_pct gpu_power_mw gpu_freq_mhz cpu_power_mw gpu_name disk_used disk_total battery_pct power_source tasks score
+  IFS=$'\t' read -r busy slots load cores ready jobs machine mem_used mem_total cpu_temp_c thermal_pressure \
+    gpu_active_pct gpu_power_mw gpu_freq_mhz cpu_power_mw gpu_name disk_used disk_total battery_pct power_source tasks <<<"$metrics"
+  [ "${cpu_temp_c:-}" = "-" ] && cpu_temp_c=""
+  [ "${thermal_pressure:-}" = "-" ] && thermal_pressure=""
+  [ "${gpu_active_pct:-}" = "-" ] && gpu_active_pct=""
+  [ "${gpu_power_mw:-}" = "-" ] && gpu_power_mw=""
+  [ "${gpu_freq_mhz:-}" = "-" ] && gpu_freq_mhz=""
+  [ "${cpu_power_mw:-}" = "-" ] && cpu_power_mw=""
+  [ "${gpu_name:-}" = "-" ] && gpu_name=""
+  [ "${power_source:-}" = "-" ] && power_source=""
   [ -n "${machine:-}" ] || machine="$AIRLIFT_ALIAS"
   mem_used="${mem_used:-0}"
   mem_total="${mem_total:-0}"
   score="$(
     awk -v busy="$busy" -v slots="$slots" -v load_value="$load" -v cores="$cores" \
-      'BEGIN { if (slots < 1) slots = 1; if (cores < 1) cores = 1; printf "%.1f", (busy / slots) * 1000 + (load_value / cores) * 100 }'
+      -v mem_used="$mem_used" -v mem_total="$mem_total" -v temp="$cpu_temp_c" \
+      -v thermal="$thermal_pressure" -v gpu="$gpu_active_pct" \
+      'BEGIN {
+        if (slots < 1) slots = 1
+        if (cores < 1) cores = 1
+        score = (busy / slots) * 1000 + (load_value / cores) * 100
+        if (mem_total > 0) {
+          mem_ratio = mem_used / mem_total
+          if (mem_ratio > 0.85) score += (mem_ratio - 0.85) * 2000
+        }
+        if (temp + 0 > 80) score += (temp - 80) * 20
+        lower = tolower(thermal)
+        if (lower != "" && lower !~ /nominal|normal|ok/) score += 500
+        if (gpu + 0 > 80) score += (gpu - 80) * 5
+        printf "%.1f", score
+      }'
   )"
-  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
     "$AIRLIFT_ALIAS" "$score" "$busy" "$slots" "$load" "$cores" "$ready" "$machine" "$AIRLIFT_TRANSPORT" "$AIRLIFT_TARGET" \
-    "$mem_used" "$mem_total" "$tasks"
+    "$mem_used" "$mem_total" "${cpu_temp_c:-}" "${thermal_pressure:-}" "${gpu_active_pct:-}" "${gpu_power_mw:-}" \
+    "${gpu_freq_mhz:-}" "${cpu_power_mw:-}" "${gpu_name:-}" "${disk_used:-0}" "${disk_total:-0}" \
+    "${battery_pct:-0}" "${power_source:-}" "${tasks:-}"
 }
 
 probe_pool() {
@@ -793,9 +900,16 @@ read_selected_record() {
     AIRLIFT_SELECTED_ALIAS AIRLIFT_SELECTED_SCORE AIRLIFT_SELECTED_BUSY AIRLIFT_SELECTED_SLOTS \
     AIRLIFT_SELECTED_LOAD AIRLIFT_SELECTED_CORES AIRLIFT_SELECTED_READY AIRLIFT_SELECTED_MACHINE \
     AIRLIFT_SELECTED_TRANSPORT AIRLIFT_SELECTED_TARGET AIRLIFT_SELECTED_MEM_USED \
-    AIRLIFT_SELECTED_MEM_TOTAL AIRLIFT_SELECTED_TASKS <<<"$record"
+    AIRLIFT_SELECTED_MEM_TOTAL AIRLIFT_SELECTED_CPU_TEMP_C AIRLIFT_SELECTED_THERMAL_PRESSURE \
+    AIRLIFT_SELECTED_GPU_ACTIVE_PCT AIRLIFT_SELECTED_GPU_POWER_MW AIRLIFT_SELECTED_GPU_FREQ_MHZ \
+    AIRLIFT_SELECTED_CPU_POWER_MW AIRLIFT_SELECTED_GPU_NAME AIRLIFT_SELECTED_DISK_USED \
+    AIRLIFT_SELECTED_DISK_TOTAL AIRLIFT_SELECTED_BATTERY_PCT AIRLIFT_SELECTED_POWER_SOURCE \
+    AIRLIFT_SELECTED_TASKS <<<"$record"
   AIRLIFT_SELECTED_MEM_USED="${AIRLIFT_SELECTED_MEM_USED:-0}"
   AIRLIFT_SELECTED_MEM_TOTAL="${AIRLIFT_SELECTED_MEM_TOTAL:-0}"
+  AIRLIFT_SELECTED_DISK_USED="${AIRLIFT_SELECTED_DISK_USED:-0}"
+  AIRLIFT_SELECTED_DISK_TOTAL="${AIRLIFT_SELECTED_DISK_TOTAL:-0}"
+  AIRLIFT_SELECTED_BATTERY_PCT="${AIRLIFT_SELECTED_BATTERY_PCT:-0}"
 }
 
 select_node() {
@@ -875,84 +989,204 @@ format_mem() {
   }'
 }
 
+format_temp() {
+  local temp="${1:-}"
+  if [ -z "$temp" ] || [ "$temp" = "-" ]; then
+    printf '%s' '-'
+  else
+    awk -v t="$temp" 'BEGIN { printf "%.0fC", t }'
+  fi
+}
+
+format_gpu() {
+  local active="${1:-}" power="${2:-0}"
+  awk -v a="$active" -v p="$power" 'BEGIN {
+    out = "-"
+    if (a != "" && a != "-") out = sprintf("%.0f%%", a)
+    if (p + 0 > 0) {
+      watts = (p + 0) / 1000
+      if (out == "-") out = sprintf("%.1fW", watts)
+      else out = out "/" sprintf("%.1fW", watts)
+    }
+    printf "%s", out
+  }'
+}
+
+format_power() {
+  local battery="${1:-}" source="${2:-}"
+  if [ -n "$battery" ] && [ "$battery" != "0" ] && [ "$battery" != "-" ]; then
+    printf '%s%%' "$battery"
+  elif [ -n "$source" ] && [ "$source" != "-" ]; then
+    printf '%s' "$source"
+  else
+    printf '%s' '-'
+  fi
+}
+
 local_metrics_line() {
-  AIRLIFT_PROJECT="${AIRLIFT_PROJECT:-~}" AIRLIFT_SLOTS="auto" bash -s <<'REMOTE'
+  metrics_script | AIRLIFT_PROJECT="${AIRLIFT_PROJECT:-~}" AIRLIFT_SLOTS="auto" bash -s
+}
+
+metrics_sampler_script() {
+  cat <<'SAMPLER'
+#!/bin/bash
 set -u
-jobs=0
-if [ -d "$HOME/.airlift/jobs" ]; then
-  for lease in "$HOME/.airlift/jobs"/job.*; do
-    [ -f "$lease" ] || continue
-    pid="$(head -n 1 "$lease" 2>/dev/null || true)"
-    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
-      jobs=$((jobs + 1))
-    else
-      rm -f "$lease"
-    fi
-  done
+
+out="${1:-}"
+owner="${2:-}"
+group="${3:-staff}"
+[ -n "$out" ] || exit 0
+
+mkdir -p "$(dirname "$out")"
+sample=""
+if [ -x /usr/bin/powermetrics ]; then
+  sample="$(/usr/bin/powermetrics --samplers thermal,gpu_power,cpu_power,ane_power -n 1 -i 500 --hide-cpu-duty-cycle 2>/dev/null || true)"
 fi
-cores="$(sysctl -n hw.logicalcpu 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || printf 1)"
-case "$cores" in ""|*[!0-9]*) cores=1 ;; esac
-[ "$cores" -ge 1 ] || cores=1
-if load_raw="$(sysctl -n vm.loadavg 2>/dev/null)"; then
-  load="$(printf '%s' "$load_raw" | tr -d '{}' | awk '{ print $1 }')"
-elif [ -r /proc/loadavg ]; then
-  load="$(awk '{ print $1 }' /proc/loadavg)"
-else
-  load=0
-fi
-case "$load" in ""|*[!0-9.]*) load=0 ;; esac
-agents="$(
-  ps -axo command= 2>/dev/null |
-    awk '
-      /(^|[[:space:]\/])(codex([^[:space:]\/]*)?|claude)([[:space:]]|$)/ &&
-      $0 !~ /airlift/ && $0 !~ /yepanywhere/ { count++ }
-      END { print count + 0 }
-    '
-)"
-busy="$jobs"
-[ "$agents" -le "$busy" ] || busy="$agents"
-slots=$(((cores + 3) / 4))
-[ "$slots" -ge 1 ] || slots=1
-ready=1
-machine="$(scutil --get ComputerName 2>/dev/null || hostname)"
-machine="$(printf '%s' "$machine" | tr '\t\n' '  ')"
-mem_total="$(sysctl -n hw.memsize 2>/dev/null || printf 0)"
-page_size="$(sysctl -n hw.pagesize 2>/dev/null || printf 4096)"
-mem_used="$(
-  vm_stat 2>/dev/null | awk -v page="$page_size" '
-    /Pages active:/ { gsub(/\./,"",$NF); a=$NF+0 }
-    /Pages wired/ { gsub(/\./,"",$NF); w=$NF+0 }
-    /Pages occupied by compressor:/ { gsub(/\./,"",$NF); c=$NF+0 }
-    END { print (a+w+c)*page + 0 }
-  '
-)"
-case "$mem_used" in ""|*[!0-9]*) mem_used=0 ;; esac
-case "$mem_total" in ""|*[!0-9]*) mem_total=0 ;; esac
-if [ "$mem_total" -gt 0 ] && [ "$mem_used" -gt "$mem_total" ]; then
-  mem_used="$mem_total"
-fi
-tasks="$(
-  ps -axo pid=,rss=,command= 2>/dev/null | awk '
-    BEGIN { first=1 }
+
+first_number_matching() {
+  pattern="$1"
+  printf '%s\n' "$sample" | awk -v pattern="$pattern" '
     {
-      pid=$1; rss=$2
-      cmd=$0
-      sub(/^[[:space:]]*[0-9]+[[:space:]]+[0-9]+[[:space:]]+/, "", cmd)
-      agent=""
-      if (cmd ~ /(^|[\/[:space:]])claude([[:space:]]|$)/ && cmd !~ /airlift/) agent="claude"
-      else if (cmd ~ /(^|[\/[:space:]])codex([[:space:]]|$)/ && cmd !~ /airlift/) agent="codex"
-      if (agent == "") next
-      gsub(/[;\t|]/, " ", cmd)
-      gsub(/\r/, "", cmd)
-      if (length(cmd) > 80) cmd=substr(cmd,1,80)
-      if (!first) printf ";"
-      first=0
-      printf "%s|%s|%s|%s", agent, pid, rss, cmd
+      line=tolower($0)
+      if (line ~ pattern) {
+        for (i = 1; i <= NF; i++) {
+          value=$i
+          gsub(/[^0-9.]/, "", value)
+          if (value ~ /^[0-9]+(\.[0-9]+)?$/) {
+            print value
+            exit
+          }
+        }
+      }
     }
   '
-)"
-printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$busy" "$slots" "$load" "$cores" "$ready" "$jobs" "$machine" "$mem_used" "$mem_total" "$tasks"
-REMOTE
+}
+
+first_text_matching() {
+  pattern="$1"
+  printf '%s\n' "$sample" | awk -v pattern="$pattern" '
+    {
+      line=tolower($0)
+      if (line ~ pattern) {
+        sub(/^[^:]*:[[:space:]]*/, "")
+        print
+        exit
+      }
+    }
+  '
+}
+
+emit() {
+  key="$1"
+  value="$(printf '%s' "${2:-}" | tr '\t\r\n' '   ')"
+  printf '%s\t%s\n' "$key" "$value"
+}
+
+cpu_temp_c="$(first_number_matching 'cpu.*temperature|temperature.*cpu|die.*temperature|package.*temperature')"
+thermal_pressure="$(first_text_matching 'thermal pressure|thermal level')"
+gpu_active_pct="$(first_number_matching 'gpu.*active.*residency|gpu.*residency|gpu.*active')"
+gpu_power_mw="$(first_number_matching 'gpu.*power')"
+gpu_freq_mhz="$(first_number_matching 'gpu.*frequency')"
+cpu_power_mw="$(first_number_matching 'cpu.*power')"
+ane_power_mw="$(first_number_matching 'ane.*power')"
+
+tmp="$(mktemp "${out}.XXXXXX")" || exit 1
+{
+  emit updated_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  emit cpu_temp_c "$cpu_temp_c"
+  emit thermal_pressure "$thermal_pressure"
+  emit gpu_active_pct "$gpu_active_pct"
+  emit gpu_power_mw "$gpu_power_mw"
+  emit gpu_freq_mhz "$gpu_freq_mhz"
+  emit cpu_power_mw "$cpu_power_mw"
+  emit ane_power_mw "$ane_power_mw"
+} >"$tmp"
+
+if [ -n "$owner" ]; then
+  chown "$owner:$group" "$tmp" 2>/dev/null || chown "$owner" "$tmp" 2>/dev/null || true
+fi
+chmod 0644 "$tmp"
+mv "$tmp" "$out"
+SAMPLER
+}
+
+metrics_cmd() {
+  local action="${1:-status}"
+  local cache="$HOME/.airlift/metrics/latest.tsv"
+  case "$action" in
+    status)
+      if [ -r "$cache" ]; then
+        say "Airlift metrics cache: $cache"
+        awk -F '\t' '{ printf "  %-18s %s\n", $1, $2 }' "$cache"
+      else
+        say "Airlift metrics sampler is not installed for this user."
+        say "Run: airlift metrics install"
+      fi
+      ;;
+    install)
+      [ "$(uname -s)" = "Darwin" ] || die "Airlift metrics install requires macOS."
+      [ -x /usr/bin/powermetrics ] || die "powermetrics is missing on this Mac."
+      /usr/bin/sudo -v || die "Administrator approval is required to install the metrics sampler."
+
+      local label support_dir script_path plist temp_script temp_plist user group
+      user="$(id -un)"
+      group="$(id -gn)"
+      label="com.airlift.metrics.$(id -u)"
+      support_dir="/Library/Application Support/Airlift"
+      script_path="$support_dir/airlift-metrics-sampler.sh"
+      plist="/Library/LaunchDaemons/$label.plist"
+
+      mkdir -p "$HOME/.airlift/metrics"
+      chmod 755 "$HOME/.airlift" "$HOME/.airlift/metrics"
+
+      temp_script="$(mktemp "${TMPDIR:-/tmp}/airlift-metrics.XXXXXX")"
+      metrics_sampler_script >"$temp_script"
+      chmod 755 "$temp_script"
+      /usr/bin/sudo /usr/bin/install -d -o root -g wheel -m 755 "$support_dir"
+      /usr/bin/sudo /usr/bin/install -o root -g wheel -m 755 "$temp_script" "$script_path"
+      rm -f "$temp_script"
+
+      temp_plist="$(mktemp "${TMPDIR:-/tmp}/airlift-metrics.XXXXXX.plist")"
+      cat >"$temp_plist" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>$label</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>$script_path</string>
+    <string>$cache</string>
+    <string>$user</string>
+    <string>$group</string>
+  </array>
+  <key>StartInterval</key>
+  <integer>5</integer>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>/tmp/airlift-metrics.out</string>
+  <key>StandardErrorPath</key>
+  <string>/tmp/airlift-metrics.err</string>
+</dict>
+</plist>
+EOF
+      /usr/bin/sudo /usr/bin/install -o root -g wheel -m 644 "$temp_plist" "$plist"
+      rm -f "$temp_plist"
+      /usr/bin/sudo /bin/launchctl bootout system "$plist" >/dev/null 2>&1 || true
+      if ! /usr/bin/sudo /bin/launchctl bootstrap system "$plist" 2>/dev/null; then
+        /usr/bin/sudo /bin/launchctl load -w "$plist"
+      fi
+      /usr/bin/sudo /bin/launchctl kickstart -k "system/$label" >/dev/null 2>&1 || true
+      /usr/bin/sudo "$script_path" "$cache" "$user" "$group" >/dev/null 2>&1 || true
+      ok "Installed the Airlift temperature/GPU sampler."
+      say "Metrics cache: $cache"
+      ;;
+    *)
+      die "Usage: airlift metrics status|install"
+      ;;
+  esac
 }
 
 pool_json() {
@@ -960,12 +1194,16 @@ pool_json() {
   load_config optional || true
   local dump
   dump="$(mktemp "${TMPDIR:-/tmp}/airlift-pool.XXXXXX")"
-  local local_line busy slots load cores ready jobs machine mem_used mem_total tasks
+  local local_line busy slots load cores ready jobs machine mem_used mem_total cpu_temp_c thermal_pressure
+  local gpu_active_pct gpu_power_mw gpu_freq_mhz cpu_power_mw gpu_name disk_used disk_total battery_pct power_source tasks
   local_line="$(local_metrics_line)"
-  IFS=$'\t' read -r busy slots load cores ready jobs machine mem_used mem_total tasks <<<"$local_line"
-  printf 'controller\tthis-mac\tlocal\t0\t%s\t%s\t%s\t%s\t%s\t%s\tlocal\tthis Mac\t%s\t%s\t%s\n' \
+  IFS=$'\t' read -r busy slots load cores ready jobs machine mem_used mem_total cpu_temp_c thermal_pressure \
+    gpu_active_pct gpu_power_mw gpu_freq_mhz cpu_power_mw gpu_name disk_used disk_total battery_pct power_source tasks <<<"$local_line"
+  printf 'controller\tthis-mac\tlocal\t0\t%s\t%s\t%s\t%s\t%s\t%s\tlocal\tthis Mac\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
     "${busy:-0}" "${slots:-1}" "${load:-0}" "${cores:-1}" "${ready:-1}" "${machine:-this Mac}" \
-    "${mem_used:-0}" "${mem_total:-0}" "$tasks" >"$dump"
+    "${mem_used:-0}" "${mem_total:-0}" "${cpu_temp_c:-}" "${thermal_pressure:-}" "${gpu_active_pct:-}" \
+    "${gpu_power_mw:-}" "${gpu_freq_mhz:-}" "${cpu_power_mw:-}" "${gpu_name:-}" "${disk_used:-0}" \
+    "${disk_total:-0}" "${battery_pct:-0}" "${power_source:-}" "${tasks:-}" >"$dump"
 
   if [ -d "$NODES_DIR" ]; then
     probe_pool "~"
@@ -975,16 +1213,22 @@ pool_json() {
       if [ -s "$AIRLIFT_PROBE_DIR/$alias" ]; then
         record="$(cat "$AIRLIFT_PROBE_DIR/$alias")"
         read_selected_record "$record"
-        printf 'worker\t%s\tonline\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+        printf 'worker\t%s\tonline\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
           "$AIRLIFT_SELECTED_ALIAS" "$AIRLIFT_SELECTED_SCORE" \
           "$AIRLIFT_SELECTED_BUSY" "$AIRLIFT_SELECTED_SLOTS" "$AIRLIFT_SELECTED_LOAD" \
           "$AIRLIFT_SELECTED_CORES" "$AIRLIFT_SELECTED_READY" "$AIRLIFT_SELECTED_MACHINE" \
           "$AIRLIFT_SELECTED_TRANSPORT" "$AIRLIFT_SELECTED_TARGET" \
           "$AIRLIFT_SELECTED_MEM_USED" "$AIRLIFT_SELECTED_MEM_TOTAL" \
+          "${AIRLIFT_SELECTED_CPU_TEMP_C:-}" "${AIRLIFT_SELECTED_THERMAL_PRESSURE:-}" \
+          "${AIRLIFT_SELECTED_GPU_ACTIVE_PCT:-}" "${AIRLIFT_SELECTED_GPU_POWER_MW:-}" \
+          "${AIRLIFT_SELECTED_GPU_FREQ_MHZ:-}" "${AIRLIFT_SELECTED_CPU_POWER_MW:-}" \
+          "${AIRLIFT_SELECTED_GPU_NAME:-}" "${AIRLIFT_SELECTED_DISK_USED:-0}" \
+          "${AIRLIFT_SELECTED_DISK_TOTAL:-0}" "${AIRLIFT_SELECTED_BATTERY_PCT:-0}" \
+          "${AIRLIFT_SELECTED_POWER_SOURCE:-}" \
           "${AIRLIFT_SELECTED_TASKS:-}" >>"$dump"
       else
         load_node "$alias"
-        printf 'worker\t%s\toffline\t0\t0\t0\t0\t0\t0\t%s\t%s\t%s\t0\t0\t\n' \
+        printf 'worker\t%s\toffline\t0\t0\t0\t0\t0\t0\t%s\t%s\t%s\t0\t0\t\t\t\t\t\t\t0\t0\t0\t\t\n' \
           "$AIRLIFT_ALIAS" "$AIRLIFT_TARGET" "$AIRLIFT_TRANSPORT" "$AIRLIFT_TARGET" >>"$dump"
       fi
     done < <(list_node_aliases)
@@ -1003,14 +1247,30 @@ with open(dump, encoding="utf-8") as handle:
         if not line:
             continue
         parts = line.split("\t")
-        parts.extend([""] * 15)
-        role, alias, status, score, busy, slots, load, cores, ready, name, transport, target, mem_used, mem_total, tasks = parts[:15]
+        parts.extend([""] * 26)
+        (
+            role, alias, status, score, busy, slots, load, cores, ready, name,
+            transport, target, mem_used, mem_total, cpu_temp_c, thermal_pressure,
+            gpu_active_pct, gpu_power_mw, gpu_freq_mhz, cpu_power_mw, gpu_name,
+            disk_used, disk_total, battery_pct, power_source, tasks
+        ) = parts[:26]
 
         def nint(value, default=0):
             try:
                 return int(float(value))
             except (TypeError, ValueError):
                 return default
+
+        def nfloat(value):
+            if value == "-":
+                return None
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return None
+
+        def text(value):
+            return "" if value == "-" else value
 
         task_list = []
         if tasks:
@@ -1040,6 +1300,17 @@ with open(dump, encoding="utf-8") as handle:
             "target": target,
             "mem_used": nint(mem_used),
             "mem_total": nint(mem_total),
+            "cpu_temp_c": nfloat(cpu_temp_c),
+            "thermal_pressure": text(thermal_pressure),
+            "gpu_active_pct": nfloat(gpu_active_pct),
+            "gpu_power_mw": nfloat(gpu_power_mw),
+            "gpu_freq_mhz": nfloat(gpu_freq_mhz),
+            "cpu_power_mw": nfloat(cpu_power_mw),
+            "gpu_name": text(gpu_name),
+            "disk_used": nint(disk_used),
+            "disk_total": nint(disk_total),
+            "battery_pct": nint(battery_pct) if battery_pct not in ("", "-") else None,
+            "power_source": text(power_source),
             "tasks": task_list,
         })
 os.remove(dump)
@@ -1066,29 +1337,49 @@ nodes_cmd() {
     pool_json
     return
   fi
-  load_config
+  load_config optional || true
+  local local_line busy slots load cores ready jobs machine mem_used mem_total cpu_temp_c thermal_pressure
+  local gpu_active_pct gpu_power_mw gpu_freq_mhz cpu_power_mw gpu_name disk_used disk_total battery_pct power_source tasks
+  local_line="$(local_metrics_line)"
+  IFS=$'\t' read -r busy slots load cores ready jobs machine mem_used mem_total cpu_temp_c thermal_pressure \
+    gpu_active_pct gpu_power_mw gpu_freq_mhz cpu_power_mw gpu_name disk_used disk_total battery_pct power_source tasks <<<"$local_line"
   probe_pool "~"
   say ""
   say "${BOLD}Airlift pool${RESET}"
-  printf '%-18s %-9s %-8s %-8s %-10s %-12s %s\n' "WORKER" "STATUS" "USE" "LOAD" "RAM" "TRANSPORT" "MACHINE"
+  printf '%-18s %-9s %-8s %-7s %-10s %-6s %-10s %-10s %-6s %-10s %s\n' \
+    "WORKER" "STATUS" "USE" "LOAD" "RAM" "CPU" "GPU" "DISK" "PWR" "NET" "MACHINE"
+  printf '%-18s %-9s %-8s %-7s %-10s %-6s %-10s %-10s %-6s %-10s %s\n' \
+    "this-mac" "local" "${busy:-0}/${slots:-1}" \
+    "${load:-0}" "$(format_mem "${mem_used:-0}" "${mem_total:-0}")" \
+    "$(format_temp "${cpu_temp_c:-}")" \
+    "$(format_gpu "${gpu_active_pct:-}" "${gpu_power_mw:-0}")" \
+    "$(format_mem "${disk_used:-0}" "${disk_total:-0}")" \
+    "$(format_power "${battery_pct:-}" "${power_source:-}")" \
+    "local" \
+    "${machine:-this Mac}"
   local alias record
   while IFS= read -r alias; do
     [ -n "$alias" ] || continue
     if [ -s "$AIRLIFT_PROBE_DIR/$alias" ]; then
       record="$(cat "$AIRLIFT_PROBE_DIR/$alias")"
       read_selected_record "$record"
-      printf '%-18s %-9s %-8s %-8s %-10s %-12s %s\n' \
+      printf '%-18s %-9s %-8s %-7s %-10s %-6s %-10s %-10s %-6s %-10s %s\n' \
         "$alias" "online" "$AIRLIFT_SELECTED_BUSY/$AIRLIFT_SELECTED_SLOTS" \
         "$AIRLIFT_SELECTED_LOAD" "$(format_mem "$AIRLIFT_SELECTED_MEM_USED" "$AIRLIFT_SELECTED_MEM_TOTAL")" \
-        "$AIRLIFT_SELECTED_TRANSPORT" "$AIRLIFT_SELECTED_MACHINE"
+        "$(format_temp "${AIRLIFT_SELECTED_CPU_TEMP_C:-}")" \
+        "$(format_gpu "${AIRLIFT_SELECTED_GPU_ACTIVE_PCT:-}" "${AIRLIFT_SELECTED_GPU_POWER_MW:-0}")" \
+        "$(format_mem "${AIRLIFT_SELECTED_DISK_USED:-0}" "${AIRLIFT_SELECTED_DISK_TOTAL:-0}")" \
+        "$(format_power "${AIRLIFT_SELECTED_BATTERY_PCT:-}" "${AIRLIFT_SELECTED_POWER_SOURCE:-}")" \
+        "$AIRLIFT_SELECTED_TRANSPORT" \
+        "$AIRLIFT_SELECTED_MACHINE"
     else
       load_node "$alias"
-      printf '%-18s %-9s %-8s %-8s %-10s %-12s %s\n' "$alias" "offline" "-" "-" "-" "$AIRLIFT_TRANSPORT" "$AIRLIFT_TARGET"
+      printf '%-18s %-9s %-8s %-7s %-10s %-6s %-10s %-10s %-6s %-10s %s\n' "$alias" "offline" "-" "-" "-" "-" "-" "-" "-" "$AIRLIFT_TRANSPORT" "$AIRLIFT_TARGET"
     fi
   done < <(list_node_aliases)
   clear_probe_pool
   say ""
-  say "USE is active agent work / configured slots. Auto routing also considers load per CPU core."
+  say "USE is active agent work / configured slots. Auto routing also considers load, RAM pressure, CPU temperature, thermal pressure, and GPU activity."
   say "Live board: airlift dashboard"
 }
 
@@ -1316,7 +1607,9 @@ local_hardware_uuid() {
 
 remote_hardware_uuid() {
   local alias="$1"
-  ssh -o BatchMode=yes -o ConnectTimeout=8 "$alias" airlift-uuid | tr -d '\n\r'
+  ssh -o BatchMode=yes -o ConnectTimeout=8 "$alias" \
+    'ioreg -d2 -c IOPlatformExpertDevice 2>/dev/null | awk -F"\"" "/IOPlatformUUID/{ print \$4; exit }"' |
+    tr -d '\n\r'
 }
 
 node_is_self() {
@@ -1435,8 +1728,20 @@ release_overlay_lock() {
   fi
 }
 
-rsync_excludes() {
-  printf '%s\n' '--exclude=node_modules' '--exclude=dist' '--exclude=build' '--exclude=.next' '--exclude=target' '--exclude=.git'
+rsync_common_excludes() {
+  printf '%s\n' '--exclude=node_modules' '--exclude=dist' '--exclude=build' '--exclude=.next' '--exclude=target'
+}
+
+rsync_pull_excludes() {
+  rsync_common_excludes
+  printf '%s\n' '--exclude=.git'
+}
+
+safe_remote_name() {
+  local name="$1"
+  name="$(printf '%s' "$name" | sed 's/[^A-Za-z0-9._-]/-/g')"
+  [ -n "$name" ] || name="project"
+  printf '%s' "$name"
 }
 
 ensure_worktree() {
@@ -1449,7 +1754,7 @@ ensure_worktree() {
     return 0
   fi
   local repo_name rel=""
-  repo_name="$(basename "$local_root")"
+  repo_name="$(safe_remote_name "$(basename "$local_root")")"
   if [ "$local_cwd" != "$local_root" ]; then
     rel="${local_cwd#"$local_root"/}"
   fi
@@ -1460,12 +1765,14 @@ ensure_worktree() {
   else
     remote_cwd="$remote_root"
   fi
+  local remote_rel expanded remote_home
+  remote_rel="airlift/worktrees/${repo_name}/${lease}"
+  remote_home="$(ssh -o BatchMode=yes "$AIRLIFT_ALIAS" 'printf %s "$HOME"' </dev/null)"
+  expanded="$remote_home/$remote_rel"
   ssh -o BatchMode=yes -o ConnectTimeout=8 "$AIRLIFT_ALIAS" \
-    "mkdir -p \"\$HOME/airlift/worktrees/$(printf '%s/%s' "$repo_name" "$lease")\"" </dev/null >/dev/null
-  local expanded
-  expanded="$(ssh -o BatchMode=yes "$AIRLIFT_ALIAS" "printf '%s' \"\$HOME/airlift/worktrees/${repo_name}/${lease}\"" </dev/null)"
+    "mkdir -p $(shell_quote "$expanded")" </dev/null >/dev/null
   # shellcheck disable=SC2046
-  rsync -a --delete $(rsync_excludes) \
+  rsync -a --delete $(rsync_common_excludes) \
     --exclude=.env --exclude=.env.local \
     "$local_root/" "$AIRLIFT_ALIAS:$expanded/"
   if [ -f "$local_root/.env" ]; then
@@ -1498,7 +1805,7 @@ write_back_worktree() {
     return 0
   fi
   # shellcheck disable=SC2046
-  rsync -a $(rsync_excludes) \
+  rsync -a --delete $(rsync_pull_excludes) \
     "$AIRLIFT_ALIAS:$remote_root/" "$local_root/"
 }
 
@@ -1892,7 +2199,8 @@ dashboard_cmd() {
   [ -n "$bin" ] || die "Could not locate the airlift executable."
 
   local server
-  server="$(mktemp "${TMPDIR:-/tmp}/airlift-dash.XXXXXX.py")"
+  server="$(mktemp "${TMPDIR:-/tmp}/airlift-dash.XXXXXX")"
+  AIRLIFT_DASH_SERVER="$server"
   cat >"$server" <<'PY'
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import os
@@ -1941,7 +2249,7 @@ if __name__ == "__main__":
         pass
 PY
   cleanup_dash() {
-    rm -f "$server"
+    [ -n "${AIRLIFT_DASH_SERVER:-}" ] && rm -f "$AIRLIFT_DASH_SERVER"
   }
   trap cleanup_dash EXIT
   export AIRLIFT_DASH_HTML="$html"
@@ -1994,6 +2302,7 @@ main() {
     shell|ssh) shell_cmd "$@" ;;
     awake) awake_cmd "$@" ;;
     sleep) sleep_cmd "$@" ;;
+    metrics) metrics_cmd "$@" ;;
     stop) stop_cmd "$@" ;;
     shutdown) shutdown_cmd "$@" ;;
     doctor) doctor_cmd "$@" ;;

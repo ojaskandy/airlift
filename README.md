@@ -26,11 +26,13 @@ git clone --branch v0.4 https://github.com/ojaskandy/airlift.git ~/airlift
 cd ~/airlift
 ./install.sh
 export PATH="$HOME/.local/bin:$PATH"
+airlift metrics install
 ```
 
 That installs `airlift` plus `claude` / `codex` shims. After the pool is joined,
-those two commands hop to a spare Mac by themselves. If every worker is asleep,
-they run locally and say so.
+those two commands hop to a spare Mac by themselves. `airlift metrics install`
+enables the controller's CPU temperature and GPU stats on the board. If every
+worker is asleep, routed tasks run locally and say so.
 
 **Workers** (spare Macs that will take the load). Run this on each one, not
 `./install.sh`:
@@ -51,8 +53,9 @@ airlift dashboard
 ```
 
 `airlift dashboard` opens a localhost board of every Mac in the pool: online
-state, load, RAM, running `claude`/`codex` tasks, and a feed of where hops went.
-It does not leave this computer. Ctrl-C in that terminal stops it.
+state, load, RAM, CPU temperature, GPU activity/power, disk, power state,
+running `claude`/`codex` tasks, and a feed of where hops went. It does not leave
+this computer. Ctrl-C in that terminal stops it.
 
 One-command worker install (same `v0.4` tree):
 
@@ -193,14 +196,19 @@ Each dispatch asks every configured worker for:
 - other running Codex and Claude processes;
 - one-minute system load;
 - logical CPU count;
+- RAM pressure;
+- CPU temperature and thermal pressure when the metrics sampler is installed;
+- GPU activity/power when the metrics sampler is installed;
 - configured concurrent slots; and
 - whether the requested project directory exists.
 
 Offline workers and workers missing the project are excluded. The remaining
 workers are scored by active work divided by slots, with load per CPU core as a
-secondary pressure signal. Ties are deterministic. `--slots auto` allocates
-roughly one slot per four logical CPU cores; set an explicit value when a beefy
-Mac should accept more concurrent work.
+secondary pressure signal. High RAM usage, high CPU temperature, non-nominal
+thermal pressure, and high GPU activity add penalties so a struggling Mac stops
+winning just because it has no current Airlift lease. Ties are deterministic.
+`--slots auto` allocates roughly one slot per four logical CPU cores; set an
+explicit value when a beefy Mac should accept more concurrent work.
 
 Routing is deliberately best-effort and decentralized. Two people dispatching
 at the exact same instant can briefly see the same score. The job lease appears
@@ -229,7 +237,8 @@ exit
 
 ```bash
 ./airlift nodes                                  # Live load across the pool
-./airlift dashboard                              # Localhost board: RAM, load, tasks
+./airlift dashboard                              # Localhost board: RAM, temp, GPU, disk, tasks
+./airlift metrics install                        # Enable CPU temp/GPU sampler on this Mac
 claude -p 'Fix the failing unit test'            # Hops off this Mac when a worker is free
 codex exec -C ~/Developer/your-repo -            # Same
 ./airlift run --project PATH 'task'              # Explicit one-shot hop (Codex)
@@ -267,6 +276,13 @@ directory:
 If the worker does not have Node.js 22 or newer, Airlift downloads the current
 Node.js LTS release from nodejs.org, verifies its SHA-256 checksum, and installs
 it under `~/.airlift/runtime`. No administrator access is required.
+
+CPU temperature and live GPU power/activity come from Apple's `powermetrics`,
+which requires administrator access. `install-worker.sh` installs a root-owned
+LaunchDaemon sampler that writes a small readable cache to
+`~/.airlift/metrics/latest.tsv`; normal dashboard refreshes read that cache and
+do not ask for a password. On a controller Mac, run `airlift metrics install`
+once if you also want this Mac's local temperature/GPU stats on the board.
 
 ## Security and trust
 
