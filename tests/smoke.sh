@@ -55,7 +55,7 @@ printf '%s\n' "$WORKER_ONE_COMMAND_DRY_RUN" | grep -F "systemsetup -setremotelog
 WORKER_WRAPPER_DRY_RUN="$("$ROOT/install.sh" --worker --dry-run)"
 printf '%s\n' "$WORKER_WRAPPER_DRY_RUN" | grep -F "systemsetup -setremotelogin on" >/dev/null
 
-"$ROOT/airlift" --version | grep -F "airlift 0.4.4"
+"$ROOT/airlift" --version | grep -F "airlift 0.4.5"
 "$ROOT/airlift" --help | grep -F "Airlift"
 "$ROOT/airlift" --help | grep -F "dashboard"
 "$ROOT/airlift" --help | grep -F "forget"
@@ -132,7 +132,7 @@ assert spare["gpu_name"] == "Apple M2 10c"
 assert spare["disk_total"] == 107374182400
 assert spare["battery_pct"] == 100
 assert spare["tasks"][0]["agent"] == "claude"
-assert data["version"] == "0.4.4"
+assert data["version"] == "0.4.5"
 '
 
 printf '0\t8\t0.2\t24\t1\t0\tBeefy Mac\t4294967296\t34359738368\t-\t-\t-\t80\t180\t900\tApple M3 Max 40c\t32212254720\t214748364800\t91\tAC Power\t\n' >"$METRICS_DIR/beefy"
@@ -192,6 +192,7 @@ grep -F -- "-fN -M" "$SSH_LOG" | grep -F "beefy" >/dev/null
 RUN_OUTPUT="$(airlift_test run --project "~/Developer/Dylan's test project" "fix the test")"
 printf '%s\n' "$RUN_OUTPUT" | grep -F "codex[$TEMP_HOME/Developer/Dylan's test project]: fix the test" >/dev/null
 grep -F "AIRLIFT_AUTH_DIR=" "$SSH_LOG" | grep -F "AIRLIFT_AGENT='codex'" >/dev/null
+grep -F "AIRLIFT_IN_EXEC=1" "$SSH_LOG" >/dev/null
 
 CLAUDE_OUTPUT="$(airlift_test run --agent claude --worker spare-air --project "~/Developer/Dylan's test project" "review this")"
 printf '%s\n' "$CLAUDE_OUTPUT" | grep -F "claude[$TEMP_HOME/Developer/Dylan's test project]: review this" >/dev/null

@@ -2,7 +2,7 @@
 
 set -euo pipefail
 
-VERSION="0.4.4"
+VERSION="0.4.5"
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/airlift"
 CONFIG_FILE="$CONFIG_DIR/config"
 NODES_DIR="$CONFIG_DIR/nodes"
@@ -2109,6 +2109,7 @@ hop_agent() {
   done
 remote_script='set -euo pipefail
 export PATH="$HOME/.airlift/runtime/bin:$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$HOME/.codex/bin:$PATH"
+export AIRLIFT_IN_EXEC=1
 unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN OPENAI_API_KEY CODEX_API_KEY
 unset CLAUDE_CODE_USE_BEDROCK CLAUDE_CODE_USE_VERTEX CLAUDE_CODE_USE_FOUNDRY
 auth_dir="$AIRLIFT_AUTH_DIR"
